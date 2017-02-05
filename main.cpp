@@ -9,6 +9,7 @@
 #include <unordered_set>
 #include <vector>
 #include <tuple>
+#include <string>
 #include <cassert>
 #include <cstdlib>
 
@@ -157,14 +158,25 @@ struct bdd_instr
     int operands[3];
 };
 
+enum {
+    ast_id_false,
+    ast_id_true,
+    ast_id_user
+};
+
 void decode(
     bdd_instr* instrs, int num_instrs,
-    int num_ast_nodes,
+    int num_user_ast_nodes,
     robdd* r,
     const node** root)
 {
-    std::vector<const node*> astnode2bddnode(num_ast_nodes);
-    const node** ast2bdd = astnode2bddnode.data() - 1;
+    std::vector<const node*> astnode2bddnode(ast_id_user + num_user_ast_nodes);
+    astnode2bddnode[ast_id_false] = false_node;
+    astnode2bddnode[ast_id_true] = true_node;
+
+    const node** ast2bdd = astnode2bddnode.data();
+
+    int main_ast_id = -1;
 
     for (int i = 0; i < num_instrs; i++)
     {
@@ -177,11 +189,13 @@ void decode(
             int ast_id = inst.operands[bdd_instr::operand_newvar_id];
             printf("new %d\n", ast_id);
 
-            int var_id = ast_id; // straightforward mapping.
-            ast2bdd[ast_id] = r->make_node(var_id, false_node, true_node);
+            ast2bdd[ast_id] = r->make_node(ast_id, false_node, true_node);
 
-            if (ast2bdd[ast_id]->var == 1)
+            if (main_ast_id == -1 || ast_id < main_ast_id)
+            {
+                main_ast_id = ast_id;
                 *root = ast2bdd[ast_id];
+            }
 
             break;
         }
@@ -196,7 +210,7 @@ void decode(
             const node* src2_bdd = ast2bdd[src2_ast_id];
             ast2bdd[dst_ast_id] = r->apply(src1_bdd, src2_bdd, opcode::bdd_and);
 
-            if (ast2bdd[dst_ast_id]->var == 1)
+            if (src1_bdd->var == main_ast_id || src2_bdd->var == main_ast_id)
                 *root = ast2bdd[dst_ast_id];
 
             break;
@@ -212,7 +226,7 @@ void decode(
             const node* src2_bdd = ast2bdd[src2_ast_id];
             ast2bdd[dst_ast_id] = r->apply(src1_bdd, src2_bdd, opcode::bdd_or);
 
-            if (ast2bdd[dst_ast_id]->var == 1)
+            if (src1_bdd->var == main_ast_id || src2_bdd->var == main_ast_id)
                 *root = ast2bdd[dst_ast_id];
 
             break;
@@ -223,6 +237,8 @@ void decode(
     }
 }
 
+std::map<int, std::string> g_astid2name;
+
 void write_dot(const robdd* bdd, const node* root, const char* fn)
 {
     FILE* f = fopen(fn, "w");
@@ -230,19 +246,29 @@ void write_dot(const robdd* bdd, const node* root, const char* fn)
     fprintf(f, "digraph {\n");
 
     std::vector<const node*> nodes2add;
-    nodes2add.push_back(root);
+    if (root)
+        nodes2add.push_back(root);
 
     std::unordered_set<const node*> added;
     added.insert(false_node);
     added.insert(true_node);
 
     std::unordered_set<const node*> declared;
-    fprintf(f, "  n%p [label=\"false\"];\n", false_node);
-    fprintf(f, "  n%p [label=\"true\"];\n", true_node);
-    fprintf(f, "  n%p [label=\"%d\"];\n", root, root->var);
-    declared.insert(false_node);
-    declared.insert(true_node);
-    declared.insert(root);
+    if (root != true_node)
+    {
+        fprintf(f, "  n%p [label=\"0\",shape=box];\n", false_node);
+        declared.insert(false_node);
+    }
+    if (root != false_node)
+    {
+        fprintf(f, "  n%p [label=\"1\",shape=box];\n", true_node);
+        declared.insert(true_node);
+    }
+    if (root && root != false_node && root != true_node)
+    {
+        fprintf(f, "  n%p [label=\"%s\"];\n", root, g_astid2name.at(root->var).c_str());
+        declared.insert(root);
+    }
 
     while (!nodes2add.empty())
     {
@@ -256,7 +282,7 @@ void write_dot(const robdd* bdd, const node* root, const char* fn)
         for (const node* child : children)
         {
             if (declared.insert(child).second)
-                fprintf(f, "  n%p [label=\"%d\"];\n", child, child->var);
+                fprintf(f, "  n%p [label=\"%s\"];\n", child, g_astid2name.at(child->var).c_str());
 
             fprintf(f, "  n%p -> n%p [style=%s];\n", n, child, child == n->lo ? "dotted" : "solid");
 
@@ -280,7 +306,7 @@ void write_dot(const robdd* bdd, const node* root, const char* fn)
 }
 
 std::vector<bdd_instr> g_bdd_instructions;
-int g_next_ast_id = 1;
+int g_next_ast_id = ast_id_user;
 
 int l_var_newindex(lua_State* L)
 {
@@ -302,18 +328,19 @@ int l_var_index(lua_State* L)
     luaL_newmetatable(L, "ast");
     lua_setmetatable(L, -2);
 
-    // var[bdd_userdata] = var_name;
-    lua_pushvalue(L, -1);
-    lua_pushvalue(L, 2);
-    lua_rawset(L, 1);
+    g_astid2name[*ast_id] = luaL_checkstring(L, 2);
+
+    lua_pushvalue(L, -2);
+    lua_pushvalue(L, -2);
+    lua_rawset(L, -5);
 
     return 1;
 }
 
 int l_and(lua_State* L)
 {
-    int* ast1_id = (int*)luaL_checkudata(L, 1, "ast");
-    int* ast2_id = (int*)luaL_checkudata(L, 2, "ast");
+    int ast1_id = *(int*)luaL_checkudata(L, 1, "ast");
+    int ast2_id = *(int*)luaL_checkudata(L, 2, "ast");
 
     int* ast_id = (int*)lua_newuserdata(L, sizeof(int));
     *ast_id = g_next_ast_id;
@@ -322,8 +349,8 @@ int l_and(lua_State* L)
     bdd_instr and_instr;
     and_instr.opcode = bdd_instr::opcode_and;
     and_instr.operands[bdd_instr::operand_and_dst_id] = *ast_id;
-    and_instr.operands[bdd_instr::operand_and_src1_id] = *ast1_id;
-    and_instr.operands[bdd_instr::operand_and_src2_id] = *ast2_id;
+    and_instr.operands[bdd_instr::operand_and_src1_id] = ast1_id;
+    and_instr.operands[bdd_instr::operand_and_src2_id] = ast2_id;
     g_bdd_instructions.push_back(and_instr);
 
     luaL_newmetatable(L, "ast");
@@ -334,8 +361,8 @@ int l_and(lua_State* L)
 
 int l_or(lua_State* L)
 {
-    int* ast1_id = (int*)luaL_checkudata(L, 1, "ast");
-    int* ast2_id = (int*)luaL_checkudata(L, 2, "ast");
+    int ast1_id = *(int*)luaL_checkudata(L, 1, "ast");
+    int ast2_id = *(int*)luaL_checkudata(L, 2, "ast");
 
     int* ast_id = (int*)lua_newuserdata(L, sizeof(int));
     *ast_id = g_next_ast_id;
@@ -344,8 +371,8 @@ int l_or(lua_State* L)
     bdd_instr or_instr;
     or_instr.opcode = bdd_instr::opcode_or;
     or_instr.operands[bdd_instr::operand_or_dst_id] = *ast_id;
-    or_instr.operands[bdd_instr::operand_or_src1_id] = *ast1_id;
-    or_instr.operands[bdd_instr::operand_or_src2_id] = *ast2_id;
+    or_instr.operands[bdd_instr::operand_or_src1_id] = ast1_id;
+    or_instr.operands[bdd_instr::operand_or_src2_id] = ast2_id;
     g_bdd_instructions.push_back(or_instr);
 
     luaL_newmetatable(L, "ast");
@@ -392,6 +419,24 @@ int main(int argc, char* argv[])
     luaL_newmetatable(L, "var_mt");
     lua_setmetatable(L, -2);
     lua_setglobal(L, "var");
+
+    lua_getglobal(L, "var");
+    lua_pushboolean(L, 0);
+    int* false_ast_id = (int*)lua_newuserdata(L, sizeof(int));
+    *false_ast_id = ast_id_false;
+    luaL_newmetatable(L, "ast");
+    lua_setmetatable(L, -2);
+    lua_rawset(L, -3);
+    lua_pop(L, 1);
+
+    lua_getglobal(L, "var");
+    lua_pushboolean(L, 1);
+    int* true_ast_id = (int*)lua_newuserdata(L, sizeof(int));
+    *true_ast_id = ast_id_true;
+    luaL_newmetatable(L, "ast");
+    lua_setmetatable(L, -2);
+    lua_rawset(L, -3);
+    lua_pop(L, 1);
     
     if (luaL_dofile(L, infile))
     {
@@ -404,7 +449,7 @@ int main(int argc, char* argv[])
 
     decode(
         g_bdd_instructions.data(), (int)g_bdd_instructions.size(), 
-        g_next_ast_id - 1, // num ast nodes
+        g_next_ast_id - ast_id_user, // num user ast nodes
         &bdd, &root);
 
     write_dot(&bdd, root, outfile);
