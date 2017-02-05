@@ -6,9 +6,11 @@
 
 #include <set>
 #include <map>
+#include <unordered_set>
 #include <vector>
 #include <tuple>
 #include <cassert>
+#include <cstdlib>
 
 struct node
 {
@@ -158,10 +160,11 @@ struct bdd_instr
 void decode(
     bdd_instr* instrs, int num_instrs,
     int num_ast_nodes,
-    robdd* r)
+    robdd* r,
+    const node** root)
 {
-    std::vector<const node*> ast2bdd_v(num_ast_nodes);
-    const node** ast2bdd = ast2bdd_v.data() - 1;
+    std::vector<const node*> astnode2bddnode(num_ast_nodes);
+    const node** ast2bdd = astnode2bddnode.data() - 1;
 
     for (int i = 0; i < num_instrs; i++)
     {
@@ -175,7 +178,10 @@ void decode(
             printf("new %d\n", ast_id);
 
             int var_id = ast_id; // straightforward mapping.
-            ast2bdd[ast_id] = r->make_node(ast_id, false_node, true_node);
+            ast2bdd[ast_id] = r->make_node(var_id, false_node, true_node);
+
+            if (ast2bdd[ast_id]->var == 1)
+                *root = ast2bdd[ast_id];
 
             break;
         }
@@ -190,6 +196,9 @@ void decode(
             const node* src2_bdd = ast2bdd[src2_ast_id];
             ast2bdd[dst_ast_id] = r->apply(src1_bdd, src2_bdd, opcode::bdd_and);
 
+            if (ast2bdd[dst_ast_id]->var == 1)
+                *root = ast2bdd[dst_ast_id];
+
             break;
         }
         case bdd_instr::opcode_or:
@@ -203,11 +212,70 @@ void decode(
             const node* src2_bdd = ast2bdd[src2_ast_id];
             ast2bdd[dst_ast_id] = r->apply(src1_bdd, src2_bdd, opcode::bdd_or);
 
+            if (ast2bdd[dst_ast_id]->var == 1)
+                *root = ast2bdd[dst_ast_id];
+
             break;
         }
         default:
             assert(false);
         }
+    }
+}
+
+void write_dot(const robdd* bdd, const node* root, const char* fn)
+{
+    FILE* f = fopen(fn, "w");
+
+    fprintf(f, "digraph {\n");
+
+    std::vector<const node*> nodes2add;
+    nodes2add.push_back(root);
+
+    std::unordered_set<const node*> added;
+    added.insert(false_node);
+    added.insert(true_node);
+
+    std::unordered_set<const node*> declared;
+    fprintf(f, "  n%p [label=\"false\"];\n", false_node);
+    fprintf(f, "  n%p [label=\"true\"];\n", true_node);
+    fprintf(f, "  n%p [label=\"%d\"];\n", root, root->var);
+    declared.insert(false_node);
+    declared.insert(true_node);
+    declared.insert(root);
+
+    while (!nodes2add.empty())
+    {
+        const node* n = nodes2add.back();
+        nodes2add.pop_back();
+
+        if (added.find(n) != added.end())
+            continue;
+
+        const node* children[] = { n->lo, n->hi };
+        for (const node* child : children)
+        {
+            if (declared.insert(child).second)
+                fprintf(f, "  n%p [label=\"%d\"];\n", child, child->var);
+
+            fprintf(f, "  n%p -> n%p [style=%s];\n", n, child, child == n->lo ? "dotted" : "solid");
+
+            if (added.find(child) == added.end())
+                nodes2add.push_back(child);
+        }
+
+        added.insert(n);
+    }
+
+    fprintf(f, "}\n");
+
+    fclose(f);
+
+    std::string dotcmd = std::string("packages\\Graphviz.2.38.0.2\\dot.exe") + " -Tpng " + fn + " -o " + fn + ".png";
+    if (system(dotcmd.c_str()) == 0)
+    {
+        std::string pngcmd = std::string(fn) + ".png";
+        system(pngcmd.c_str());
     }
 }
 
@@ -290,9 +358,12 @@ int main(int argc, char* argv[])
 {
     if (argc < 2)
     {
-        printf("Usage: %s <filename>\n", argc >= 1 ? argv[0] : "robdd");
+        printf("Usage: %s <input file> [output file]\n", argc >= 1 ? argv[0] : "robdd");
         return 0;
     }
+
+    const char* infile = argv[1];
+    const char* outfile = argc >= 3 ? argv[2] : NULL;
 
     lua_State* L = luaL_newstate();
     luaL_openlibs(L);
@@ -322,13 +393,19 @@ int main(int argc, char* argv[])
     lua_setmetatable(L, -2);
     lua_setglobal(L, "var");
     
-    if (luaL_dofile(L, argv[1]))
+    if (luaL_dofile(L, infile))
     {
         printf("%s\n", lua_tostring(L, -1));
         return 1;
     }
 
-    int num_ast_nodes = g_next_ast_id - 1;
-    robdd r;
-    decode(g_bdd_instructions.data(), (int)g_bdd_instructions.size(), num_ast_nodes, &r);
+    robdd bdd;
+    const node* root = NULL;
+
+    decode(
+        g_bdd_instructions.data(), (int)g_bdd_instructions.size(), 
+        g_next_ast_id - 1, // num ast nodes
+        &bdd, &root);
+
+    write_dot(&bdd, root, outfile);
 }
