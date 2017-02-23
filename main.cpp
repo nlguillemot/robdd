@@ -1,3 +1,10 @@
+// TODO:
+// * Make the root node logic more robust (handle multiple roots?)
+// * Extend the algorithm to multi-core using fork/join parallelism
+// * Improve the hashtable data-structure (used to have unique nodes)
+// * Improve the cache data-structure (used to avoid recomputing the ITE)
+// * Try solving a more interesting problem (full adder? N-queens?)
+
 #include <tbb/task.h>
 
 #include <lua.hpp>
