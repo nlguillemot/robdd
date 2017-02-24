@@ -2,6 +2,7 @@ n = 2
 
 title = tostring(n) .. '-bit ripple carry adder'
 
+-- declare the inputs backwards to allow the circuit to reuse previous nodes
 for i=n,1,-1 do
     a = input['a' .. tostring(i - 1)]
     b = input['b' .. tostring(i - 1)]
