@@ -142,14 +142,14 @@ public:
 struct bdd_instr
 {
     enum {
-        opcode_newvar,
+        opcode_newinput,
         opcode_and,
         opcode_or,
         opcode_xor,
     };
 
     enum {
-        operand_newvar_id
+        operand_newinput_id
     };
 
     enum {
@@ -210,9 +210,9 @@ void decode(
 
         switch (inst.opcode)
         {
-        case bdd_instr::opcode_newvar:
+        case bdd_instr::opcode_newinput:
         {
-            int ast_id = inst.operands[bdd_instr::operand_newvar_id];
+            int ast_id = inst.operands[bdd_instr::operand_newinput_id];
             printf("new %d\n", ast_id);
 
             const node* new_bdd = r->make_node(ast_id, false_node, true_node);
@@ -389,21 +389,21 @@ void write_dot(
 std::vector<bdd_instr> g_bdd_instructions;
 int g_next_ast_id = ast_id_user;
 
-int l_var_newindex(lua_State* L)
+int l_input_newindex(lua_State* L)
 {
-    luaL_error(L, "Cannot write to variables table");
+    luaL_error(L, "Cannot write to inputs table");
     return 0;
 }
 
-int l_var_index(lua_State* L)
+int l_input_index(lua_State* L)
 {
     int* ast_id = (int*)lua_newuserdata(L, sizeof(int));
     *ast_id = g_next_ast_id;
     g_next_ast_id += 1;
 
     bdd_instr new_instr;
-    new_instr.opcode = bdd_instr::opcode_newvar;
-    new_instr.operands[bdd_instr::operand_newvar_id] = *ast_id;
+    new_instr.opcode = bdd_instr::opcode_newinput;
+    new_instr.operands[bdd_instr::operand_newinput_id] = *ast_id;
     g_bdd_instructions.push_back(new_instr);
 
     luaL_newmetatable(L, "ast");
@@ -511,22 +511,22 @@ int main(int argc, char* argv[])
     }
     lua_pop(L, 1);
 
-    luaL_newmetatable(L, "var_mt");
+    luaL_newmetatable(L, "input_mt");
     {
-        lua_pushcfunction(L, l_var_newindex);
+        lua_pushcfunction(L, l_input_newindex);
         lua_setfield(L, -2, "__newindex");
 
-        lua_pushcfunction(L, l_var_index);
+        lua_pushcfunction(L, l_input_index);
         lua_setfield(L, -2, "__index");
     }
     lua_pop(L, 1);
 
     lua_newtable(L);
-    luaL_newmetatable(L, "var_mt");
+    luaL_newmetatable(L, "input_mt");
     lua_setmetatable(L, -2);
-    lua_setglobal(L, "var");
+    lua_setglobal(L, "input");
 
-    lua_getglobal(L, "var");
+    lua_getglobal(L, "input");
     lua_pushboolean(L, 0);
     int* false_ast_id = (int*)lua_newuserdata(L, sizeof(int));
     *false_ast_id = ast_id_false;
@@ -535,7 +535,7 @@ int main(int argc, char* argv[])
     lua_rawset(L, -3);
     lua_pop(L, 1);
 
-    lua_getglobal(L, "var");
+    lua_getglobal(L, "input");
     lua_pushboolean(L, 1);
     int* true_ast_id = (int*)lua_newuserdata(L, sizeof(int));
     *true_ast_id = ast_id_true;
@@ -543,6 +543,9 @@ int main(int argc, char* argv[])
     lua_setmetatable(L, -2);
     lua_rawset(L, -3);
     lua_pop(L, 1);
+
+    lua_newtable(L);
+    lua_setglobal(L, "output");
     
     if (luaL_dofile(L, infile))
     {
@@ -555,10 +558,10 @@ int main(int argc, char* argv[])
     {
         auto read_results = [](lua_State* L)
         {
-            auto p_root_ast_ids = (std::vector<int>*)lua_touserdata(L, 2);
-            auto p_root_ast_names = (std::vector<std::string>*)lua_touserdata(L, 3);
+            auto p_root_ast_ids = (std::vector<int>*)lua_touserdata(L, 1);
+            auto p_root_ast_names = (std::vector<std::string>*)lua_touserdata(L, 2);
 
-            lua_pushvalue(L, 1);
+            lua_getglobal(L, "output");
             lua_pushnil(L);
             while (lua_next(L, -2))
             {
@@ -589,16 +592,13 @@ int main(int argc, char* argv[])
         };
 
         lua_pushcfunction(L, read_results);
-        lua_pushvalue(L, -2);
         lua_pushlightuserdata(L, &root_ast_ids);
         lua_pushlightuserdata(L, &root_ast_names);
-        if (lua_pcall(L, 3, 0, 0))
+        if (lua_pcall(L, 2, 0, 0))
         {
             printf("%s\n", lua_tostring(L, -1));
             return 1;
         }
-     
-        lua_pop(L, 1);
     }
 
     lua_getglobal(L, "title");

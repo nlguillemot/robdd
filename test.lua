@@ -1,7 +1,10 @@
-a = var.a
-b = var.b
-c = var.c
+title = 'test'
+
+a = input.a
+b = input.b
+c = input.c
 r1 = a*b + a*c + b*c
 r2 = b*c
 
-return {r1 = r1, r2 = r2}
+output.r1 = r1;
+output.r2 = r2;
