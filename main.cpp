@@ -1,9 +1,8 @@
 // TODO:
-// * Make the root node logic more robust (handle multiple roots?)
+// * Try solving a more interesting problem (full adder? N-queens?)
 // * Extend the algorithm to multi-core using fork/join parallelism
 // * Improve the hashtable data-structure (used to have unique nodes)
 // * Improve the cache data-structure (used to avoid recomputing the ITE)
-// * Try solving a more interesting problem (full adder? N-queens?)
 
 #include <tbb/task.h>
 
@@ -172,22 +171,32 @@ enum {
 };
 
 void decode(
-    bdd_instr* instrs, int num_instrs,
+    int num_instrs, bdd_instr* instrs,
     int num_user_ast_nodes,
+    int num_root_ast_ids, int* root_ast_ids,
     robdd* r,
-    const node** root)
+    const node** roots)
 {
     std::vector<const node*> astnode2bddnode(ast_id_user + num_user_ast_nodes);
     astnode2bddnode[ast_id_false] = false_node;
     astnode2bddnode[ast_id_true] = true_node;
 
-    const node** ast2bdd = astnode2bddnode.data();
+    for (int root_ast_idx = 0; root_ast_idx < num_root_ast_ids; root_ast_idx++)
+    {
+        if (root_ast_ids[root_ast_idx] == ast_id_true)
+            roots[root_ast_idx] = true_node;
+        else if (root_ast_ids[root_ast_idx] == ast_id_false)
+            roots[root_ast_idx] = false_node;
+    }
 
-    int main_ast_id = -1;
+    const node** ast2bdd = astnode2bddnode.data();
 
     for (int i = 0; i < num_instrs; i++)
     {
         const bdd_instr& inst = instrs[i];
+
+        int inst_dst_ast_id = -1;
+        const node* inst_dst_node = NULL;
 
         switch (inst.opcode)
         {
@@ -196,13 +205,12 @@ void decode(
             int ast_id = inst.operands[bdd_instr::operand_newvar_id];
             printf("new %d\n", ast_id);
 
-            ast2bdd[ast_id] = r->make_node(ast_id, false_node, true_node);
+            const node* new_bdd = r->make_node(ast_id, false_node, true_node);
+            
+            ast2bdd[ast_id] = new_bdd;
 
-            if (main_ast_id == -1 || ast_id < main_ast_id)
-            {
-                main_ast_id = ast_id;
-                *root = ast2bdd[ast_id];
-            }
+            inst_dst_ast_id = ast_id;
+            inst_dst_node = new_bdd;
 
             break;
         }
@@ -215,10 +223,12 @@ void decode(
 
             const node* src1_bdd = ast2bdd[src1_ast_id];
             const node* src2_bdd = ast2bdd[src2_ast_id];
-            ast2bdd[dst_ast_id] = r->apply(src1_bdd, src2_bdd, opcode::bdd_and);
+            const node* new_bdd = r->apply(src1_bdd, src2_bdd, opcode::bdd_and);
+            
+            ast2bdd[dst_ast_id] = new_bdd;
 
-            if (src1_bdd->var == main_ast_id || src2_bdd->var == main_ast_id)
-                *root = ast2bdd[dst_ast_id];
+            inst_dst_ast_id = dst_ast_id;
+            inst_dst_node = new_bdd;
 
             break;
         }
@@ -231,50 +241,82 @@ void decode(
 
             const node* src1_bdd = ast2bdd[src1_ast_id];
             const node* src2_bdd = ast2bdd[src2_ast_id];
-            ast2bdd[dst_ast_id] = r->apply(src1_bdd, src2_bdd, opcode::bdd_or);
+            const node* new_bdd = r->apply(src1_bdd, src2_bdd, opcode::bdd_or);
 
-            if (src1_bdd->var == main_ast_id || src2_bdd->var == main_ast_id)
-                *root = ast2bdd[dst_ast_id];
+            ast2bdd[dst_ast_id] = new_bdd;
+
+            inst_dst_ast_id = dst_ast_id;
+            inst_dst_node = new_bdd;
 
             break;
         }
         default:
             assert(false);
         }
+
+        for (int root_ast_idx = 0; root_ast_idx < num_root_ast_ids; root_ast_idx++)
+        {
+            if (inst_dst_ast_id == root_ast_ids[root_ast_idx])
+            {
+                roots[root_ast_idx] = inst_dst_node;
+            }
+        }
     }
 }
 
 std::map<int, std::string> g_astid2name;
 
-void write_dot(const robdd* bdd, const node* root, const char* fn)
+void write_dot(
+    const robdd* bdd, 
+    int num_roots, const node** roots, const std::string* root_names,
+    const char* fn)
 {
     FILE* f = fopen(fn, "w");
 
     fprintf(f, "digraph {\n");
 
     std::vector<const node*> nodes2add;
-    if (root)
-        nodes2add.push_back(root);
+    nodes2add.insert(nodes2add.end(), roots, roots + num_roots);
 
     std::unordered_set<const node*> added;
     added.insert(false_node);
     added.insert(true_node);
 
+    bool true_in_roots = std::find(roots, roots + num_roots, true_node) != roots + num_roots;
+    bool fales_in_roots = std::find(roots, roots + num_roots, false_node) != roots + num_roots;
+
     std::unordered_set<const node*> declared;
-    if (root != true_node)
+    if (!true_in_roots)
     {
         fprintf(f, "  n%p [label=\"0\",shape=box];\n", false_node);
         declared.insert(false_node);
     }
-    if (root != false_node)
+    if (!fales_in_roots)
     {
         fprintf(f, "  n%p [label=\"1\",shape=box];\n", true_node);
         declared.insert(true_node);
     }
-    if (root && root != false_node && root != true_node)
+
+    for (int root_idx = 0; root_idx < num_roots; root_idx++)
     {
-        fprintf(f, "  n%p [label=\"%s\"];\n", root, g_astid2name.at(root->var).c_str());
-        declared.insert(root);
+        if (roots[root_idx] == true_node || roots[root_idx] == false_node)
+        {
+            continue;
+        }
+
+        if (declared.find(roots[root_idx]) != end(declared))
+        {
+            continue;
+        }
+
+        fprintf(f, "  n%p [label=\"%s\"];\n", roots[root_idx], g_astid2name.at(roots[root_idx]->var).c_str());
+        declared.insert(roots[root_idx]);
+    }
+
+    for (int root_idx = 0; root_idx < num_roots; root_idx++)
+    {
+        fprintf(f, "  r%d [label=\"%s\"];\n", root_idx, root_names[root_idx].c_str());
+        fprintf(f, "  r%d -> n%p [style=solid];\n", root_idx, roots[root_idx]);
     }
 
     while (!nodes2add.empty())
@@ -451,13 +493,69 @@ int main(int argc, char* argv[])
         return 1;
     }
 
+    std::vector<int> root_ast_ids;
+    std::vector<std::string> root_ast_names;
+    {
+        auto read_results = [](lua_State* L)
+        {
+            auto p_root_ast_ids = (std::vector<int>*)lua_touserdata(L, 2);
+            auto p_root_ast_names = (std::vector<std::string>*)lua_touserdata(L, 3);
+
+            lua_pushvalue(L, 1);
+            lua_pushnil(L);
+            while (lua_next(L, -2))
+            {
+                lua_pushvalue(L, -2);
+
+                const char* ast_name = lua_tostring(L, -1);
+                int ast_id;
+                if (lua_isboolean(L, -2))
+                {
+                    if (lua_toboolean(L, -2))
+                        ast_id = ast_id_true;
+                    else
+                        ast_id = ast_id_false;
+                }
+                else
+                {
+                    ast_id = *(int*)luaL_checkudata(L, -2, "ast");
+                }
+
+                p_root_ast_ids->push_back(ast_id);
+                p_root_ast_names->push_back(ast_name);
+
+                lua_pop(L, 2);
+            }
+            lua_pop(L, 1);
+
+            return 0;
+        };
+
+        lua_pushcfunction(L, read_results);
+        lua_pushvalue(L, -2);
+        lua_pushlightuserdata(L, &root_ast_ids);
+        lua_pushlightuserdata(L, &root_ast_names);
+        if (lua_pcall(L, 3, 0, 0))
+        {
+            printf("%s\n", lua_tostring(L, -1));
+            return 1;
+        }
+     
+        lua_pop(L, 1);
+    }
+
     robdd bdd;
-    const node* root = NULL;
+    std::vector<const node*> roots(root_ast_ids.size());
 
     decode(
-        g_bdd_instructions.data(), (int)g_bdd_instructions.size(), 
+        (int)g_bdd_instructions.size(), g_bdd_instructions.data(),
         g_next_ast_id - ast_id_user, // num user ast nodes
-        &bdd, &root);
+        (int)root_ast_ids.size(), root_ast_ids.data(),
+        &bdd,
+        roots.data());
 
-    write_dot(&bdd, root, outfile);
+    write_dot(
+        &bdd, 
+        (int)roots.size(), roots.data(), root_ast_names.data(),
+        outfile);
 }
