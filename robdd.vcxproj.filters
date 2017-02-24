@@ -6,5 +6,6 @@
   <ItemGroup>
     <None Include="test.lua" />
     <None Include="packages.config" />
+    <None Include="adder.lua" />
   </ItemGroup>
 </Project>

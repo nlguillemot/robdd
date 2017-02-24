@@ -81,6 +81,7 @@
     <ClCompile Include="main.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <None Include="adder.lua" />
     <None Include="packages.config" />
     <None Include="test.lua" />
   </ItemGroup>
