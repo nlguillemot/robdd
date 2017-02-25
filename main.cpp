@@ -49,7 +49,7 @@ private:
 
     class uniquetable
     {
-        static const uint32_t capacity = 0x10000;
+        static const uint32_t capacity = 0x100000;
         static_assert((capacity & (capacity - 1)) == 0, "capacity must be power of two");
 
         static const uint32_t bddutmask = capacity - 1;
