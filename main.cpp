@@ -35,16 +35,16 @@ public:
     };
 
 private:
-    struct node
+    class unique_table
     {
-        uint32_t var;
-        node_handle lo;
-        node_handle hi;
-    };
+        struct node
+        {
+            uint32_t var;
+            node_handle lo;
+            node_handle hi;
+        };
 
-    class uniquetable
-    {
-        static const uint32_t capacity = 0x100000;
+        static const uint32_t capacity = 0x8000000;
         static_assert((capacity & (capacity - 1)) == 0, "capacity must be power of two");
 
         static const uint32_t bddutmask = capacity - 1;
@@ -89,7 +89,7 @@ private:
         }
 
     public:
-        uniquetable()
+        unique_table()
         {
             pool.reset(new poolnode[capacity]);
             for (uint32_t i = 0; i < capacity; i++)
@@ -163,48 +163,67 @@ private:
         }
     };
 
-    uniquetable uniquetb;
+    class computed_table
+    {
+        static const uint32_t capacity = 0x100000;
+        static_assert((capacity & (capacity - 1)) == 0, "capacity must be power of two");
+
+        static const uint32_t bddctmask = capacity - 1;
+
+        struct ctnode
+        {
+            node_handle bdd1;
+            node_handle bdd2;
+            node_handle op;
+            node_handle result;
+        };
+
+        std::unique_ptr<ctnode[]> table;
+
+        static constexpr uint32_t hash(node_handle bdd1, node_handle bdd2, uint32_t op)
+        {
+            return bddctmask & (bdd1 + bdd2 + op);
+        }
+
+    public:
+        computed_table()
+        {
+            table.reset(new ctnode[capacity]);
+            for (uint32_t i = 0; i < capacity; i++)
+            {
+                table[i].bdd1 = invalid_handle;
+            }
+        }
+
+        node_handle find(node_handle bdd1, node_handle bdd2, uint32_t op)
+        {
+            uint32_t h = hash(bdd1, bdd2, op);
+            ctnode found = table[h];
+            if (found.bdd1 == bdd1 &&
+                found.bdd2 == bdd2 &&
+                found.op == op) 
+            {
+                return found.result;
+            }
+            else
+            {
+                return invalid_handle;
+            }
+        }
+
+        void insert(node_handle bdd1, node_handle bdd2, uint32_t op, node_handle r)
+        {
+            uint32_t h = hash(bdd1, bdd2, op);
+            table[h] = ctnode{ bdd1, bdd2, op, r };
+        }
+    };
+
+    unique_table uniquetb;
 
     node_handle false_node;
     node_handle true_node;
 
-    struct cache_key
-    {
-        node_handle lo;
-        node_handle hi;
-        uint32_t op;
-
-        bool operator<(const cache_key& other) const
-        {
-            return std::tie(lo, hi, op) < std::tie(other.lo, other.hi, other.op);
-        }
-    };
-
-    std::map<cache_key, node_handle> cache;
-
-    bool is_terminal(node_handle n)
-    {
-        return n == false_node || n == true_node;
-    }
-
-    bool terminal_value(node_handle n)
-    {
-        return n == true_node;
-    }
-
-    node_handle operation(node_handle bdd1, node_handle bdd2, uint32_t op)
-    {
-        switch (op)
-        {
-        case opcode::bdd_and:
-            return (terminal_value(bdd1) && terminal_value(bdd2)) ? true_node : false_node;
-        case opcode::bdd_or:
-            return (terminal_value(bdd1) || terminal_value(bdd2)) ? true_node : false_node;
-        case opcode::bdd_xor:
-            return (terminal_value(bdd1) != terminal_value(bdd2)) ? true_node : false_node;
-        }
-        return NULL;
-    }
+    computed_table computedtb;
 
 public:
     robdd()
@@ -250,15 +269,29 @@ public:
 
     node_handle apply(node_handle bdd1, node_handle bdd2, uint32_t op)
     {
-        auto found = cache.find(cache_key{ bdd1,bdd2,op }); 
-        if (found != cache.end())
+        node_handle found = computedtb.find(bdd1, bdd2, op);
+        if (found != invalid_handle)
         {
-            return found->second;
+            return found;
         }
         
-        if (is_terminal(bdd1) && is_terminal(bdd2))
+        // handle terminal vs terminal op
+        if ((bdd1 == false_node || bdd1 == true_node) &&
+            (bdd2 == false_node || bdd2 == true_node))
         {
-            return operation(bdd1, bdd2, op);
+            bool bdd1_value = bdd1 == true_node;
+            bool bdd2_value = bdd2 == true_node;
+
+            switch (op)
+            {
+            case opcode::bdd_and:
+                return (bdd1_value && bdd2_value) ? true_node : false_node;
+            case opcode::bdd_or:
+                return (bdd1_value || bdd2_value) ? true_node : false_node;
+            case opcode::bdd_xor:
+                return (bdd1_value != bdd2_value) ? true_node : false_node;
+            }
+            return invalid_handle;
         }
         
         node_handle n;
@@ -279,7 +312,9 @@ public:
             node_handle hi = apply(bdd1, get_hi(bdd2), op);
             n = make_node(get_var(bdd2), lo, hi);
         }
-        cache.emplace(cache_key{ bdd1, bdd2, op }, n);
+
+        computedtb.insert(bdd1, bdd2, op, n);
+
         return n;
     }
 };
