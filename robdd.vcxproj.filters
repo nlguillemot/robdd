@@ -7,5 +7,6 @@
     <None Include="test.lua" />
     <None Include="packages.config" />
     <None Include="adder.lua" />
+    <None Include="queens.lua" />
   </ItemGroup>
 </Project>

@@ -83,6 +83,7 @@
   <ItemGroup>
     <None Include="adder.lua" />
     <None Include="packages.config" />
+    <None Include="queens.lua" />
     <None Include="test.lua" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

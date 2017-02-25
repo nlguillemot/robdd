@@ -146,32 +146,41 @@ struct bdd_instr
         opcode_and,
         opcode_or,
         opcode_xor,
-    };
-
-    enum {
-        operand_newinput_id
-    };
-
-    enum {
-        operand_and_dst_id,
-        operand_and_src1_id,
-        operand_and_src2_id,
-    };
-
-    enum {
-        operand_or_dst_id,
-        operand_or_src1_id,
-        operand_or_src2_id,
-    };
-
-    enum {
-        operand_xor_dst_id,
-        operand_xor_src1_id,
-        operand_xor_src2_id,
+        opcode_not
     };
 
     int opcode;
-    int operands[3];
+
+    union
+    {
+        struct {
+            int operand_newinput_id;
+            const std::string* operand_newinput_name;
+        };
+
+        struct {
+            int operand_and_dst_id;
+            int operand_and_src1_id;
+            int operand_and_src2_id;
+        };
+
+        struct {
+            int operand_or_dst_id;
+            int operand_or_src1_id;
+            int operand_or_src2_id;
+        };
+
+        struct {
+            int operand_xor_dst_id;
+            int operand_xor_src1_id;
+            int operand_xor_src2_id;
+        };
+
+        struct {
+            int operand_not_dst_id;
+            int operand_not_src_id;
+        };
+    };
 };
 
 enum {
@@ -212,8 +221,10 @@ void decode(
         {
         case bdd_instr::opcode_newinput:
         {
-            int ast_id = inst.operands[bdd_instr::operand_newinput_id];
-            printf("new %d\n", ast_id);
+            int ast_id = inst.operand_newinput_id;
+            const char* ast_name = inst.operand_newinput_name->c_str();
+
+            printf("new %d (%s)\n", ast_id, ast_name);
 
             const node* new_bdd = r->make_node(ast_id, false_node, true_node);
             
@@ -226,15 +237,15 @@ void decode(
         }
         case bdd_instr::opcode_and:
         {
-            int dst_ast_id = inst.operands[bdd_instr::operand_and_dst_id];
-            int src1_ast_id = inst.operands[bdd_instr::operand_and_src1_id];
-            int src2_ast_id = inst.operands[bdd_instr::operand_and_src2_id];
+            int dst_ast_id  = inst.operand_and_dst_id;
+            int src1_ast_id = inst.operand_and_src1_id;
+            int src2_ast_id = inst.operand_and_src2_id;
             printf("%d = %d AND %d\n", dst_ast_id, src1_ast_id, src2_ast_id);
 
             const node* src1_bdd = ast2bdd[src1_ast_id];
             const node* src2_bdd = ast2bdd[src2_ast_id];
             const node* new_bdd = r->apply(src1_bdd, src2_bdd, opcode::bdd_and);
-            
+
             ast2bdd[dst_ast_id] = new_bdd;
 
             inst_dst_ast_id = dst_ast_id;
@@ -244,9 +255,9 @@ void decode(
         }
         case bdd_instr::opcode_or:
         {
-            int dst_ast_id = inst.operands[bdd_instr::operand_or_dst_id];
-            int src1_ast_id = inst.operands[bdd_instr::operand_or_src1_id];
-            int src2_ast_id = inst.operands[bdd_instr::operand_or_src2_id];
+            int dst_ast_id  = inst.operand_or_dst_id;
+            int src1_ast_id = inst.operand_or_src1_id;
+            int src2_ast_id = inst.operand_or_src2_id;
             printf("%d = %d OR %d\n", dst_ast_id, src1_ast_id, src2_ast_id);
 
             const node* src1_bdd = ast2bdd[src1_ast_id];
@@ -262,14 +273,30 @@ void decode(
         }
         case bdd_instr::opcode_xor:
         {
-            int dst_ast_id = inst.operands[bdd_instr::operand_xor_dst_id];
-            int src1_ast_id = inst.operands[bdd_instr::operand_xor_src1_id];
-            int src2_ast_id = inst.operands[bdd_instr::operand_xor_src2_id];
+            int dst_ast_id = inst.operand_xor_dst_id;
+            int src1_ast_id = inst.operand_xor_src1_id;
+            int src2_ast_id = inst.operand_xor_src2_id;
             printf("%d = %d XOR %d\n", dst_ast_id, src1_ast_id, src2_ast_id);
 
             const node* src1_bdd = ast2bdd[src1_ast_id];
             const node* src2_bdd = ast2bdd[src2_ast_id];
             const node* new_bdd = r->apply(src1_bdd, src2_bdd, opcode::bdd_xor);
+
+            ast2bdd[dst_ast_id] = new_bdd;
+
+            inst_dst_ast_id = dst_ast_id;
+            inst_dst_node = new_bdd;
+
+            break;
+        }
+        case bdd_instr::opcode_not:
+        {
+            int dst_ast_id = inst.operand_not_dst_id;
+            int src_ast_id = inst.operand_not_src_id;
+            printf("%d = NOT %d\n", dst_ast_id, src_ast_id);
+
+            const node* src_bdd = ast2bdd[src_ast_id];
+            const node* new_bdd = r->apply(src_bdd, true_node, opcode::bdd_xor);
 
             ast2bdd[dst_ast_id] = new_bdd;
 
@@ -296,7 +323,7 @@ std::map<int, std::string> g_astid2name;
 
 void write_dot(
     const char* title,
-    const robdd* bdd, 
+    const robdd* bdd,
     int num_roots, const node** roots, const std::string* root_names,
     const char* fn)
 {
@@ -314,34 +341,28 @@ void write_dot(
     added.insert(false_node);
     added.insert(true_node);
 
-    bool true_in_roots = std::find(roots, roots + num_roots, true_node) != roots + num_roots;
-    bool false_in_roots = std::find(roots, roots + num_roots, false_node) != roots + num_roots;
-
     std::unordered_set<const node*> declared;
-    if (!true_in_roots)
-    {
-        fprintf(f, "  n%p [label=\"0\",shape=box];\n", false_node);
-        declared.insert(false_node);
-    }
-    if (!false_in_roots)
-    {
-        fprintf(f, "  n%p [label=\"1\",shape=box];\n", true_node);
-        declared.insert(true_node);
-    }
 
     for (int root_idx = 0; root_idx < num_roots; root_idx++)
     {
-        if (roots[root_idx] == true_node || roots[root_idx] == false_node)
-        {
-            continue;
-        }
-
         if (declared.find(roots[root_idx]) != end(declared))
         {
             continue;
         }
 
-        fprintf(f, "  n%p [label=\"%s\"];\n", roots[root_idx], g_astid2name.at(roots[root_idx]->var).c_str());
+        if (roots[root_idx] == false_node)
+        {
+            fprintf(f, "  n%p [label=\"0\",shape=box];\n", false_node);
+        }
+        else if (roots[root_idx] == true_node)
+        {
+            fprintf(f, "  n%p [label=\"1\",shape=box];\n", true_node);
+        }
+        else
+        {
+            fprintf(f, "  n%p [label=\"%s\"];\n", roots[root_idx], g_astid2name.at(roots[root_idx]->var).c_str());
+        }
+
         declared.insert(roots[root_idx]);
     }
 
@@ -363,7 +384,20 @@ void write_dot(
         for (const node* child : children)
         {
             if (declared.insert(child).second)
-                fprintf(f, "  n%p [label=\"%s\"];\n", child, g_astid2name.at(child->var).c_str());
+            {
+                if (child == false_node)
+                {
+                    fprintf(f, "  n%p [label=\"0\",shape=box];\n", false_node);
+                }
+                else if (child == true_node)
+                {
+                    fprintf(f, "  n%p [label=\"1\",shape=box];\n", true_node);
+                }
+                else
+                {
+                    fprintf(f, "  n%p [label=\"%s\"];\n", child, g_astid2name.at(child->var).c_str());
+                }
+            }
 
             fprintf(f, "  n%p -> n%p [style=%s];\n", n, child, child == n->lo ? "dotted" : "solid");
 
@@ -401,15 +435,16 @@ int l_input_index(lua_State* L)
     *ast_id = g_next_ast_id;
     g_next_ast_id += 1;
 
+    auto astid2name = g_astid2name.emplace(*ast_id, luaL_checkstring(L, 2)).first;
+
     bdd_instr new_instr;
     new_instr.opcode = bdd_instr::opcode_newinput;
-    new_instr.operands[bdd_instr::operand_newinput_id] = *ast_id;
+    new_instr.operand_newinput_id = *ast_id;
+    new_instr.operand_newinput_name = &astid2name->second;
     g_bdd_instructions.push_back(new_instr);
 
     luaL_newmetatable(L, "ast");
     lua_setmetatable(L, -2);
-
-    g_astid2name[*ast_id] = luaL_checkstring(L, 2);
 
     lua_pushvalue(L, -2);
     lua_pushvalue(L, -2);
@@ -418,10 +453,18 @@ int l_input_index(lua_State* L)
     return 1;
 }
 
+int arg_to_ast(lua_State* L, int argidx)
+{
+    if (lua_isboolean(L, argidx))
+        return lua_toboolean(L, argidx) ? ast_id_true : ast_id_false;
+    else
+        return *(int*)luaL_checkudata(L, argidx, "ast");
+}
+
 int l_and(lua_State* L)
 {
-    int ast1_id = *(int*)luaL_checkudata(L, 1, "ast");
-    int ast2_id = *(int*)luaL_checkudata(L, 2, "ast");
+    int ast1_id = arg_to_ast(L, 1);
+    int ast2_id = arg_to_ast(L, 2);
 
     int* ast_id = (int*)lua_newuserdata(L, sizeof(int));
     *ast_id = g_next_ast_id;
@@ -429,9 +472,9 @@ int l_and(lua_State* L)
 
     bdd_instr and_instr;
     and_instr.opcode = bdd_instr::opcode_and;
-    and_instr.operands[bdd_instr::operand_and_dst_id] = *ast_id;
-    and_instr.operands[bdd_instr::operand_and_src1_id] = ast1_id;
-    and_instr.operands[bdd_instr::operand_and_src2_id] = ast2_id;
+    and_instr.operand_and_dst_id = *ast_id;
+    and_instr.operand_and_src1_id = ast1_id;
+    and_instr.operand_and_src2_id = ast2_id;
     g_bdd_instructions.push_back(and_instr);
 
     luaL_newmetatable(L, "ast");
@@ -442,8 +485,8 @@ int l_and(lua_State* L)
 
 int l_or(lua_State* L)
 {
-    int ast1_id = *(int*)luaL_checkudata(L, 1, "ast");
-    int ast2_id = *(int*)luaL_checkudata(L, 2, "ast");
+    int ast1_id = arg_to_ast(L, 1);
+    int ast2_id = arg_to_ast(L, 2);
 
     int* ast_id = (int*)lua_newuserdata(L, sizeof(int));
     *ast_id = g_next_ast_id;
@@ -451,9 +494,9 @@ int l_or(lua_State* L)
 
     bdd_instr or_instr;
     or_instr.opcode = bdd_instr::opcode_or;
-    or_instr.operands[bdd_instr::operand_or_dst_id] = *ast_id;
-    or_instr.operands[bdd_instr::operand_or_src1_id] = ast1_id;
-    or_instr.operands[bdd_instr::operand_or_src2_id] = ast2_id;
+    or_instr.operand_or_dst_id = *ast_id;
+    or_instr.operand_or_src1_id = ast1_id;
+    or_instr.operand_or_src2_id = ast2_id;
     g_bdd_instructions.push_back(or_instr);
 
     luaL_newmetatable(L, "ast");
@@ -464,8 +507,8 @@ int l_or(lua_State* L)
 
 int l_xor(lua_State* L)
 {
-    int ast1_id = *(int*)luaL_checkudata(L, 1, "ast");
-    int ast2_id = *(int*)luaL_checkudata(L, 2, "ast");
+    int ast1_id = arg_to_ast(L, 1);
+    int ast2_id = arg_to_ast(L, 2);
 
     int* ast_id = (int*)lua_newuserdata(L, sizeof(int));
     *ast_id = g_next_ast_id;
@@ -473,10 +516,30 @@ int l_xor(lua_State* L)
 
     bdd_instr xor_instr;
     xor_instr.opcode = bdd_instr::opcode_xor;
-    xor_instr.operands[bdd_instr::operand_xor_dst_id] = *ast_id;
-    xor_instr.operands[bdd_instr::operand_xor_src1_id] = ast1_id;
-    xor_instr.operands[bdd_instr::operand_xor_src2_id] = ast2_id;
+    xor_instr.operand_xor_dst_id = *ast_id;
+    xor_instr.operand_xor_src1_id = ast1_id;
+    xor_instr.operand_xor_src2_id = ast2_id;
     g_bdd_instructions.push_back(xor_instr);
+
+    luaL_newmetatable(L, "ast");
+    lua_setmetatable(L, -2);
+
+    return 1;
+}
+
+int l_not(lua_State* L)
+{
+    int ast_id_in = arg_to_ast(L, 1);
+
+    int* ast_id = (int*)lua_newuserdata(L, sizeof(int));
+    *ast_id = g_next_ast_id;
+    g_next_ast_id += 1;
+
+    bdd_instr not_instr;
+    not_instr.opcode = bdd_instr::opcode_not;
+    not_instr.operand_not_dst_id = *ast_id;
+    not_instr.operand_not_src_id = ast_id_in;
+    g_bdd_instructions.push_back(not_instr);
 
     luaL_newmetatable(L, "ast");
     lua_setmetatable(L, -2);
@@ -493,7 +556,9 @@ int main(int argc, char* argv[])
     }
 
     const char* infile = argv[1];
-    const char* outfile = argc >= 3 ? argv[2] : NULL;
+
+    std::string default_outfile = std::string(argv[1]) + ".dot";
+    const char* outfile = argc >= 3 ? argv[2] : default_outfile.c_str();
 
     lua_State* L = luaL_newstate();
     luaL_openlibs(L);
@@ -508,6 +573,9 @@ int main(int argc, char* argv[])
 
         lua_pushcfunction(L, l_xor);
         lua_setfield(L, -2, "__pow");
+
+        lua_pushcfunction(L, l_not);
+        lua_setfield(L, -2, "__unm");
     }
     lua_pop(L, 1);
 
