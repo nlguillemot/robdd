@@ -8,5 +8,8 @@
     <None Include="packages.config" />
     <None Include="adder.lua" />
     <None Include="queens.lua" />
+    <None Include="japan.lua" />
+    <None Include="coloring.lua" />
+    <None Include="usa.lua" />
   </ItemGroup>
 </Project>
