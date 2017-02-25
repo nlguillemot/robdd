@@ -40,11 +40,6 @@ private:
         uint32_t var;
         node_handle lo;
         node_handle hi;
-
-        bool operator==(const node& other) const
-        {
-            return other.var == var && other.lo == lo && other.hi == hi;
-        }
     };
 
     class uniquetable
@@ -60,14 +55,27 @@ private:
             node_handle next;
         };
         std::unique_ptr<poolnode[]> pool;
-        node_handle poolhead;
+        node_handle pool_head;
 
         node* pool_alloc()
         {
-            assert(poolhead != invalid_handle);
-            node_handle head = poolhead;
-            poolhead = pool[head].next;
+            if (pool_head == invalid_handle)
+            {
+                printf("pool_alloc failed\n");
+                std::abort();
+            }
+
+            node_handle head = pool_head;
+            pool_head = pool[head].next;
+
             return &pool[head].data;
+        }
+
+        void pool_free(const node* n)
+        {
+            poolnode* p = (poolnode*)n;
+            p->next = pool_head;
+            pool_head = to_handle(n);
         }
 
         std::unique_ptr<node_handle[]> table;
@@ -89,7 +97,7 @@ private:
                 pool[i].next = i + 1;
             }
             pool[capacity - 1].next = invalid_handle;
-            poolhead = 0;
+            pool_head = 0;
 
             table.reset(new node_handle[capacity]);
             for (uint32_t i = 0; i < capacity; i++)
@@ -131,14 +139,14 @@ private:
             return pool[h].data.hi;
         }
 
-        node_handle insert(const node& desc)
+        node_handle insert(uint32_t var, node_handle lo, node_handle hi)
         {
-            uint32_t p = bddutmask & (desc.var + desc.lo + desc.hi);
+            uint32_t p = bddutmask & (var + lo + hi);
             
             while (table[p] != invalid_handle)
             {
                 const node* curr = &pool[table[p]].data;
-                if (*curr == desc)
+                if (curr->var == var && curr->lo == lo && curr->hi == hi)
                 {
                     return to_handle(curr);
                 }
@@ -146,7 +154,9 @@ private:
             }
 
             node* new_node = pool_alloc();
-            *new_node = desc;
+            new_node->var = var;
+            new_node->lo = lo;
+            new_node->hi = hi;
             node_handle handle = to_handle(new_node);
             table[p] = handle;
             return handle;
@@ -235,7 +245,7 @@ public:
         // enforce uniqueness constraint of ROBDD
         // hash table returns the node if it exists
         // and inserts the node if it doesn't
-        return uniquetb.insert(node{ var, lo, hi });
+        return uniquetb.insert(var, lo, hi);
     }
 
     node_handle apply(node_handle bdd1, node_handle bdd2, uint32_t op)
@@ -365,7 +375,7 @@ void decode(
             printf("new %d (%s)\n", ast_id, ast_name);
 
             robdd::node_handle new_bdd = r->make_node(ast_id, false_node, true_node);
-            
+
             ast2bdd[ast_id] = new_bdd;
 
             inst_dst_ast_id = ast_id;
