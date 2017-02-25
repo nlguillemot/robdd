@@ -1,5 +1,6 @@
 // TODO:
 // * Count the number of solutions and output a sample solution
+// * Consider implementing garbage collection
 // * Extend the algorithm to multi-core using fork/join parallelism
 // * Improve the hashtable data-structure (used to have unique nodes)
 // * Improve the cache data-structure (used to avoid recomputing the ITE)
@@ -10,7 +11,6 @@
 #include <lauxlib.h>
 #include <lualib.h>
 
-#include <set>
 #include <map>
 #include <unordered_set>
 #include <vector>
@@ -19,70 +19,150 @@
 #include <cassert>
 #include <cstdlib>
 
-struct node
-{
-    int var;
-    const node* lo;
-    const node* hi;
-};
-
-node terminal_nodes[2] = {
-    node{ INT_MAX,     &terminal_nodes[0], &terminal_nodes[0] },
-    node{ INT_MAX - 1, &terminal_nodes[1], &terminal_nodes[1] }
-};
-const node* const false_node = &terminal_nodes[0];
-const node* const true_node = &terminal_nodes[1];
-
-namespace opcode
-{
-    enum {
-        bdd_and,
-        bdd_or,
-        bdd_xor
-    };
-}
-
-bool is_terminal(const node* n)
-{
-    return n == false_node || n == true_node;
-}
-
-bool terminal_value(const node* n)
-{
-    return n == true_node;
-}
-
-const node* operation(const node* bdd1, const node* bdd2, int op)
-{
-    switch (op)
-    {
-    case opcode::bdd_and:
-        return (terminal_value(bdd1) && terminal_value(bdd2)) ? true_node : false_node;
-    case opcode::bdd_or:
-        return (terminal_value(bdd1) || terminal_value(bdd2)) ? true_node : false_node;
-    case opcode::bdd_xor:
-        return (terminal_value(bdd1) != terminal_value(bdd2)) ? true_node : false_node;
-    }
-    return NULL;
-}
-
 class robdd
 {
-    struct node_cmp
+public:
+    using node_handle = uint32_t;
+    static const node_handle invalid_handle = -1;
+
+    struct opcode
     {
-        bool operator()(const node& a, const node& b) const
+        enum {
+            bdd_and,
+            bdd_or,
+            bdd_xor
+        };
+    };
+
+private:
+    struct node
+    {
+        uint32_t var;
+        node_handle lo;
+        node_handle hi;
+
+        bool operator==(const node& other) const
         {
-            return std::tie(a.var, a.lo, a.hi) < std::tie(b.var, b.lo, b.hi);
+            return other.var == var && other.lo == lo && other.hi == hi;
         }
     };
 
-    std::set<node, node_cmp> hashtable;
+    class uniquetable
+    {
+        static const uint32_t capacity = 0x10000;
+        static_assert((capacity & (capacity - 1)) == 0, "capacity must be power of two");
+
+        static const uint32_t bddutmask = capacity - 1;
+
+        union poolnode
+        {
+            node data;
+            node_handle next;
+        };
+        std::unique_ptr<poolnode[]> pool;
+        node_handle poolhead;
+
+        node* pool_alloc()
+        {
+            assert(poolhead != invalid_handle);
+            node_handle head = poolhead;
+            poolhead = pool[head].next;
+            return &pool[head].data;
+        }
+
+        std::unique_ptr<node_handle[]> table;
+
+        node* false_node;
+        node* true_node;
+
+        node_handle to_handle(const node* n) const
+        {
+            return node_handle((poolnode*)n - &pool[0]);
+        }
+
+    public:
+        uniquetable()
+        {
+            pool.reset(new poolnode[capacity]);
+            for (uint32_t i = 0; i < capacity; i++)
+            {
+                pool[i].next = i + 1;
+            }
+            pool[capacity - 1].next = invalid_handle;
+            poolhead = 0;
+
+            table.reset(new node_handle[capacity]);
+            for (uint32_t i = 0; i < capacity; i++)
+            {
+                table[i] = invalid_handle;
+            }
+
+            false_node = pool_alloc();
+            false_node->var = INT_MAX;
+            false_node->lo = false_node->hi = to_handle(false_node);
+
+            true_node = pool_alloc();
+            true_node->var = INT_MAX - 1;
+            true_node->lo = true_node->hi = to_handle(true_node);
+        }
+
+        node_handle get_false() const
+        {
+            return to_handle(false_node);
+        }
+
+        node_handle get_true() const
+        {
+            return to_handle(true_node);
+        }
+
+        uint32_t get_var(node_handle h) const
+        {
+            return pool[h].data.var;
+        }
+
+        node_handle get_lo(node_handle h) const
+        {
+            return pool[h].data.lo;
+        }
+
+        node_handle get_hi(node_handle h) const
+        {
+            return pool[h].data.hi;
+        }
+
+        node_handle insert(const node& desc)
+        {
+            uint32_t p = bddutmask & (desc.var + desc.lo + desc.hi);
+            
+            while (table[p] != invalid_handle)
+            {
+                const node* curr = &pool[table[p]].data;
+                if (*curr == desc)
+                {
+                    return to_handle(curr);
+                }
+                p = (p + 1) & bddutmask;
+            }
+
+            node* new_node = pool_alloc();
+            *new_node = desc;
+            node_handle handle = to_handle(new_node);
+            table[p] = handle;
+            return handle;
+        }
+    };
+
+    uniquetable uniquetb;
+
+    node_handle false_node;
+    node_handle true_node;
 
     struct cache_key
     {
-        const node* lo;
-        const node* hi;
-        int op;
+        node_handle lo;
+        node_handle hi;
+        uint32_t op;
 
         bool operator<(const cache_key& other) const
         {
@@ -90,20 +170,75 @@ class robdd
         }
     };
 
-    std::map<cache_key, const node*> cache;
+    std::map<cache_key, node_handle> cache;
+
+    bool is_terminal(node_handle n)
+    {
+        return n == false_node || n == true_node;
+    }
+
+    bool terminal_value(node_handle n)
+    {
+        return n == true_node;
+    }
+
+    node_handle operation(node_handle bdd1, node_handle bdd2, uint32_t op)
+    {
+        switch (op)
+        {
+        case opcode::bdd_and:
+            return (terminal_value(bdd1) && terminal_value(bdd2)) ? true_node : false_node;
+        case opcode::bdd_or:
+            return (terminal_value(bdd1) || terminal_value(bdd2)) ? true_node : false_node;
+        case opcode::bdd_xor:
+            return (terminal_value(bdd1) != terminal_value(bdd2)) ? true_node : false_node;
+        }
+        return NULL;
+    }
 
 public:
-    const node* make_node(int var, const node* lo, const node* hi)
+    robdd()
+    {
+        false_node = uniquetb.get_false();
+        true_node = uniquetb.get_true();
+    }
+
+    node_handle get_false() const
+    {
+        return false_node;
+    }
+
+    node_handle get_true() const
+    {
+        return true_node;
+    }
+
+    uint32_t get_var(node_handle h) const
+    {
+        return uniquetb.get_var(h);
+    }
+
+    node_handle get_lo(node_handle h) const
+    {
+        return uniquetb.get_lo(h);
+    }
+
+    node_handle get_hi(node_handle h) const
+    {
+        return uniquetb.get_hi(h);
+    }
+
+    node_handle make_node(uint32_t var, node_handle lo, node_handle hi)
     {
         // enforce no-redundance constraint of ROBDD
         if (lo == hi) return lo;
         // enforce uniqueness constraint of ROBDD
         // hash table returns the node if it exists
         // and inserts the node if it doesn't
-        return &*hashtable.insert(node{ var, lo, hi }).first;
+        return uniquetb.insert(node{ var, lo, hi });
     }
 
-    const node* apply(const node* bdd1, const node* bdd2, int op)
+    node_handle apply(node_handle bdd1, node_handle bdd2, uint32_t op)
     {
         auto found = cache.find(cache_key{ bdd1,bdd2,op }); 
         if (found != cache.end())
@@ -116,23 +251,23 @@ public:
             return operation(bdd1, bdd2, op);
         }
         
-        const node* n;
-        if (bdd1->var == bdd2->var)
+        node_handle n;
+        if (get_var(bdd1) == get_var(bdd2))
         {
-            const node* lo = apply(bdd1->lo, bdd2->lo, op);
-            const node* hi = apply(bdd1->hi, bdd2->hi, op);
-            n = make_node(bdd1->var, lo, hi);
+            node_handle lo = apply(get_lo(bdd1), get_lo(bdd2), op);
+            node_handle hi = apply(get_hi(bdd1), get_hi(bdd2), op);
+            n = make_node(get_var(bdd1), lo, hi);
         }
-        else if (bdd1->var < bdd2->var)
+        else if (get_var(bdd1) < get_var(bdd2))
         {
-            const node* lo = apply(bdd1->lo, bdd2, op);
-            const node* hi = apply(bdd1->hi, bdd2, op);
-            n = make_node(bdd1->var, lo, hi);
+            node_handle lo = apply(get_lo(bdd1), bdd2, op);
+            node_handle hi = apply(get_hi(bdd1), bdd2, op);
+            n = make_node(get_var(bdd1), lo, hi);
         }
         else {
-            const node* lo = apply(bdd1, bdd2->lo, op);
-            const node* hi = apply(bdd1, bdd2->hi, op);
-            n = make_node(bdd2->var, lo, hi);
+            node_handle lo = apply(bdd1, get_lo(bdd2), op);
+            node_handle hi = apply(bdd1, get_hi(bdd2), op);
+            n = make_node(get_var(bdd2), lo, hi);
         }
         cache.emplace(cache_key{ bdd1, bdd2, op }, n);
         return n;
@@ -194,9 +329,12 @@ void decode(
     int num_user_ast_nodes,
     int num_root_ast_ids, int* root_ast_ids,
     robdd* r,
-    const node** roots)
+    robdd::node_handle* roots)
 {
-    std::vector<const node*> astnode2bddnode(ast_id_user + num_user_ast_nodes);
+    robdd::node_handle false_node = r->get_false();
+    robdd::node_handle true_node = r->get_true();
+
+    std::vector<robdd::node_handle> astnode2bddnode(ast_id_user + num_user_ast_nodes);
     astnode2bddnode[ast_id_false] = false_node;
     astnode2bddnode[ast_id_true] = true_node;
 
@@ -208,14 +346,14 @@ void decode(
             roots[root_ast_idx] = false_node;
     }
 
-    const node** ast2bdd = astnode2bddnode.data();
+    robdd::node_handle* ast2bdd = astnode2bddnode.data();
 
     for (int i = 0; i < num_instrs; i++)
     {
         const bdd_instr& inst = instrs[i];
 
         int inst_dst_ast_id = -1;
-        const node* inst_dst_node = NULL;
+        robdd::node_handle inst_dst_node = robdd::invalid_handle;
 
         switch (inst.opcode)
         {
@@ -226,7 +364,7 @@ void decode(
 
             printf("new %d (%s)\n", ast_id, ast_name);
 
-            const node* new_bdd = r->make_node(ast_id, false_node, true_node);
+            robdd::node_handle new_bdd = r->make_node(ast_id, false_node, true_node);
             
             ast2bdd[ast_id] = new_bdd;
 
@@ -242,9 +380,9 @@ void decode(
             int src2_ast_id = inst.operand_and_src2_id;
             printf("%d = %d AND %d\n", dst_ast_id, src1_ast_id, src2_ast_id);
 
-            const node* src1_bdd = ast2bdd[src1_ast_id];
-            const node* src2_bdd = ast2bdd[src2_ast_id];
-            const node* new_bdd = r->apply(src1_bdd, src2_bdd, opcode::bdd_and);
+            robdd::node_handle src1_bdd = ast2bdd[src1_ast_id];
+            robdd::node_handle src2_bdd = ast2bdd[src2_ast_id];
+            robdd::node_handle new_bdd = r->apply(src1_bdd, src2_bdd, robdd::opcode::bdd_and);
 
             ast2bdd[dst_ast_id] = new_bdd;
 
@@ -260,9 +398,9 @@ void decode(
             int src2_ast_id = inst.operand_or_src2_id;
             printf("%d = %d OR %d\n", dst_ast_id, src1_ast_id, src2_ast_id);
 
-            const node* src1_bdd = ast2bdd[src1_ast_id];
-            const node* src2_bdd = ast2bdd[src2_ast_id];
-            const node* new_bdd = r->apply(src1_bdd, src2_bdd, opcode::bdd_or);
+            robdd::node_handle src1_bdd = ast2bdd[src1_ast_id];
+            robdd::node_handle src2_bdd = ast2bdd[src2_ast_id];
+            robdd::node_handle new_bdd = r->apply(src1_bdd, src2_bdd, robdd::opcode::bdd_or);
 
             ast2bdd[dst_ast_id] = new_bdd;
 
@@ -278,9 +416,9 @@ void decode(
             int src2_ast_id = inst.operand_xor_src2_id;
             printf("%d = %d XOR %d\n", dst_ast_id, src1_ast_id, src2_ast_id);
 
-            const node* src1_bdd = ast2bdd[src1_ast_id];
-            const node* src2_bdd = ast2bdd[src2_ast_id];
-            const node* new_bdd = r->apply(src1_bdd, src2_bdd, opcode::bdd_xor);
+            robdd::node_handle src1_bdd = ast2bdd[src1_ast_id];
+            robdd::node_handle src2_bdd = ast2bdd[src2_ast_id];
+            robdd::node_handle new_bdd = r->apply(src1_bdd, src2_bdd, robdd::opcode::bdd_xor);
 
             ast2bdd[dst_ast_id] = new_bdd;
 
@@ -295,8 +433,8 @@ void decode(
             int src_ast_id = inst.operand_not_src_id;
             printf("%d = NOT %d\n", dst_ast_id, src_ast_id);
 
-            const node* src_bdd = ast2bdd[src_ast_id];
-            const node* new_bdd = r->apply(src_bdd, true_node, opcode::bdd_xor);
+            robdd::node_handle src_bdd = ast2bdd[src_ast_id];
+            robdd::node_handle new_bdd = r->apply(src_bdd, true_node, robdd::opcode::bdd_xor);
 
             ast2bdd[dst_ast_id] = new_bdd;
 
@@ -323,25 +461,33 @@ std::map<int, std::string> g_astid2name;
 
 void write_dot(
     const char* title,
-    const robdd* bdd,
-    int num_roots, const node** roots, const std::string* root_names,
+    int num_roots, const robdd::node_handle* roots, const std::string* root_names,
+    const robdd* r,
     const char* fn)
 {
+    robdd::node_handle false_node = r->get_false();
+    robdd::node_handle true_node = r->get_true();
+
     FILE* f = fopen(fn, "w");
+    
+    if (!f)
+    {
+        printf("failed to open %s\n", fn);
+    }
 
     fprintf(f, "digraph {\n");
 
     fprintf(f, "  labelloc=\"t\";\n");
     fprintf(f, "  label=\"%s\";\n", title);
 
-    std::vector<const node*> nodes2add;
+    std::vector<robdd::node_handle> nodes2add;
     nodes2add.insert(nodes2add.end(), roots, roots + num_roots);
 
-    std::unordered_set<const node*> added;
+    std::unordered_set<robdd::node_handle> added;
     added.insert(false_node);
     added.insert(true_node);
 
-    std::unordered_set<const node*> declared;
+    std::unordered_set<robdd::node_handle> declared;
 
     for (int root_idx = 0; root_idx < num_roots; root_idx++)
     {
@@ -352,15 +498,15 @@ void write_dot(
 
         if (roots[root_idx] == false_node)
         {
-            fprintf(f, "  n%p [label=\"0\",shape=box];\n", false_node);
+            fprintf(f, "  n%x [label=\"0\",shape=box];\n", false_node);
         }
         else if (roots[root_idx] == true_node)
         {
-            fprintf(f, "  n%p [label=\"1\",shape=box];\n", true_node);
+            fprintf(f, "  n%x [label=\"1\",shape=box];\n", true_node);
         }
         else
         {
-            fprintf(f, "  n%p [label=\"%s\"];\n", roots[root_idx], g_astid2name.at(roots[root_idx]->var).c_str());
+            fprintf(f, "  n%x [label=\"%s\"];\n", roots[root_idx], g_astid2name.at(r->get_var(roots[root_idx])).c_str());
         }
 
         declared.insert(roots[root_idx]);
@@ -369,37 +515,37 @@ void write_dot(
     for (int root_idx = 0; root_idx < num_roots; root_idx++)
     {
         fprintf(f, "  r%d [label=\"%s\",style=filled];\n", root_idx, root_names[root_idx].c_str());
-        fprintf(f, "  r%d -> n%p [style=solid];\n", root_idx, roots[root_idx]);
+        fprintf(f, "  r%d -> n%x [style=solid];\n", root_idx, roots[root_idx]);
     }
 
     while (!nodes2add.empty())
     {
-        const node* n = nodes2add.back();
+        robdd::node_handle n = nodes2add.back();
         nodes2add.pop_back();
 
         if (added.find(n) != added.end())
             continue;
 
-        const node* children[] = { n->lo, n->hi };
-        for (const node* child : children)
+        const robdd::node_handle children[] = { r->get_lo(n), r->get_hi(n) };
+        for (robdd::node_handle child : children)
         {
             if (declared.insert(child).second)
             {
                 if (child == false_node)
                 {
-                    fprintf(f, "  n%p [label=\"0\",shape=box];\n", false_node);
+                    fprintf(f, "  n%x [label=\"0\",shape=box];\n", false_node);
                 }
                 else if (child == true_node)
                 {
-                    fprintf(f, "  n%p [label=\"1\",shape=box];\n", true_node);
+                    fprintf(f, "  n%x [label=\"1\",shape=box];\n", true_node);
                 }
                 else
                 {
-                    fprintf(f, "  n%p [label=\"%s\"];\n", child, g_astid2name.at(child->var).c_str());
+                    fprintf(f, "  n%x [label=\"%s\"];\n", child, g_astid2name.at(r->get_var(child)).c_str());
                 }
             }
 
-            fprintf(f, "  n%p -> n%p [style=%s];\n", n, child, child == n->lo ? "dotted" : "solid");
+            fprintf(f, "  n%x -> n%x [style=%s];\n", n, child, child == r->get_lo(n) ? "dotted" : "solid");
 
             if (added.find(child) == added.end())
                 nodes2add.push_back(child);
@@ -674,7 +820,7 @@ int main(int argc, char* argv[])
     lua_pop(L, 1);
 
     robdd bdd;
-    std::vector<const node*> roots(root_ast_ids.size());
+    std::vector<robdd::node_handle> roots(root_ast_ids.size());
 
     decode(
         (int)g_bdd_instructions.size(), g_bdd_instructions.data(),
@@ -685,7 +831,7 @@ int main(int argc, char* argv[])
 
     write_dot(
         title,
-        &bdd,
         (int)roots.size(), roots.data(), root_ast_names.data(),
+        &bdd,
         outfile);
 }
