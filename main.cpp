@@ -1,5 +1,5 @@
 // TODO:
-// * Try solving a more interesting problem (full adder? N-queens?)
+// * Count the number of solutions and output a sample solution
 // * Extend the algorithm to multi-core using fork/join parallelism
 // * Improve the hashtable data-structure (used to have unique nodes)
 // * Improve the cache data-structure (used to avoid recomputing the ITE)
