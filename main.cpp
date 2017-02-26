@@ -24,6 +24,21 @@
 #include <cassert>
 #include <cstdlib>
 
+//#define SINGLETHREADED
+
+#define ITTPROFILE
+
+#ifdef ITTPROFILE
+#include <C:\Program Files (x86)\IntelSWTools\VTune Amplifier 2016 for Systems\include\ittnotify.h>
+#pragma comment(lib, "C:\\Program Files (x86)\\IntelSWTools\\VTune Amplifier 2016 for Systems\\lib64\\libittnotify.lib")
+#endif
+
+#ifdef ITTPROFILE
+__itt_domain* robdd_itt_domain = __itt_domain_create(L"robdd");
+__itt_string_handle* robdd_itt_decode_task = __itt_string_handle_create(L"decode");
+__itt_string_handle* robdd_itt_apply_task = __itt_string_handle_create(L"apply");
+#endif
+
 class robdd
 {
 public:
@@ -67,8 +82,6 @@ private:
         {
             for (;;)
             {
-                MemoryBarrier();
-
                 uint32_t old_head = pool_head;
 
                 if (old_head == invalid_handle)
@@ -161,17 +174,18 @@ private:
 
             for (;;)
             {
-                MemoryBarrier();
-
-                if (table[p] != invalid_handle)
                 {
-                    const node* curr = &pool[table[p]].data;
-                    if (curr->var == var && curr->lo == lo && curr->hi == hi)
+                    uint32_t tab = table[p];
+                    if (tab != invalid_handle)
                     {
-                        return to_handle(curr);
+                        const node* curr = &pool[tab].data;
+                        if (curr->var == var && curr->lo == lo && curr->hi == hi)
+                        {
+                            return to_handle(curr);
+                        }
+                        p = (p + 1) & bddutmask;
+                        continue;
                     }
-                    p = (p + 1) & bddutmask;
-                    continue;
                 }
 
                 node* new_node = pool_alloc();
@@ -308,6 +322,9 @@ public:
         true_node = uniquetb.get_true();
 
         max_level = tbb::task_scheduler_init::default_num_threads() - 1;
+#ifdef SINGLETHREADED
+        max_level = 0;
+#endif
     }
 
     node_handle get_false() const
@@ -374,30 +391,13 @@ public:
         
         node_handle n;
         
-        if (level >= max_level)
+#ifndef SINGLETHREADED
+        if (level < max_level)
         {
-            node_handle lo, hi;
-            if (get_var(bdd1) == get_var(bdd2))
-            {
-                lo = apply(get_lo(bdd1), get_lo(bdd2), op, level);
-                hi = apply(get_hi(bdd1), get_hi(bdd2), op, level);
-                n = make_node(get_var(bdd1), lo, hi);
-            }
-            else if (get_var(bdd1) < get_var(bdd2))
-            {
-                lo = apply(get_lo(bdd1), bdd2, op, level);
-                hi = apply(get_hi(bdd1), bdd2, op, level);
-                n = make_node(get_var(bdd1), lo, hi);
-            }
-            else
-            {
-                lo = apply(bdd1, get_lo(bdd2), op, level);
-                hi = apply(bdd1, get_hi(bdd2), op, level);
-                n = make_node(get_var(bdd2), lo, hi);
-            }
-        }
-        else
-        {
+#ifdef ITTPROFILE
+            __itt_task_begin(robdd_itt_domain, __itt_null, __itt_null, robdd_itt_apply_task);
+#endif
+
             tbb::task_group g;
             node_handle lo, hi;
 
@@ -417,6 +417,33 @@ public:
             {
                 g.run([&] { lo = apply(bdd1, get_lo(bdd2), op, level + 1); });
                 g.run_and_wait([&] { hi = apply(bdd1, get_hi(bdd2), op, level + 1); });
+                n = make_node(get_var(bdd2), lo, hi);
+            }
+
+#ifdef ITTPROFILE
+            __itt_task_end(robdd_itt_domain);
+#endif
+        }
+        else
+#endif
+        {
+            node_handle lo, hi;
+            if (get_var(bdd1) == get_var(bdd2))
+            {
+                lo = apply(get_lo(bdd1), get_lo(bdd2), op, level);
+                hi = apply(get_hi(bdd1), get_hi(bdd2), op, level);
+                n = make_node(get_var(bdd1), lo, hi);
+            }
+            else if (get_var(bdd1) < get_var(bdd2))
+            {
+                lo = apply(get_lo(bdd1), bdd2, op, level);
+                hi = apply(get_hi(bdd1), bdd2, op, level);
+                n = make_node(get_var(bdd1), lo, hi);
+            }
+            else
+            {
+                lo = apply(bdd1, get_lo(bdd2), op, level);
+                hi = apply(bdd1, get_hi(bdd2), op, level);
                 n = make_node(get_var(bdd2), lo, hi);
             }
         }
@@ -484,6 +511,10 @@ void decode(
     robdd* r,
     robdd::node_handle* roots)
 {
+#ifdef ITTPROFILE
+    __itt_task_begin(robdd_itt_domain, __itt_null, __itt_null, robdd_itt_decode_task);
+#endif
+
     robdd::node_handle false_node = r->get_false();
     robdd::node_handle true_node = r->get_true();
 
@@ -608,6 +639,10 @@ void decode(
             }
         }
     }
+
+#ifdef ITTPROFILE
+    __itt_task_end(robdd_itt_domain);
+#endif
 }
 
 std::map<int, std::string> g_astid2name;
@@ -1007,6 +1042,8 @@ int main(int argc, char* argv[])
     {
         printf("Finished in %.3lf microseconds\n", double(now.QuadPart - then.QuadPart) * 1000000.0 / freq.QuadPart);
     }
+
+    return 0;
 
     printf("writing dot file...\n");
 

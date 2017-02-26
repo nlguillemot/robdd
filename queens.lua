@@ -1,4 +1,4 @@
-n = 10
+n = 11
 
 title = tostring(n) .. '-queens problem'
 
