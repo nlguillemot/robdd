@@ -1,9 +1,5 @@
 // TODO:
 // * Count the number of solutions and output a sample solution
-// * Consider implementing garbage collection
-// * Extend the algorithm to multi-core using fork/join parallelism
-// * Improve the hashtable data-structure (used to have unique nodes)
-// * Improve the cache data-structure (used to avoid recomputing the ITE)
 
 #include <tbb/task_scheduler_init.h>
 #include <tbb/task_group.h>
@@ -187,24 +183,26 @@ private:
 
         static const uint32_t bddctmask = capacity - 1;
 
-        __declspec(align(64))
         struct ctnode
         {
             uint32_t op;
             node_handle bdd1;
             node_handle bdd2;
             node_handle result;
-        };
 
-        struct ctnode_free
-        {
-            void operator()(ctnode* n)
+            ctnode() = default;
+
+            ctnode(uint32_t op, node_handle bdd1, node_handle bdd2, node_handle result)
             {
-                _aligned_free(n);
+                this->op = op;
+                this->bdd1 = bdd1;
+                this->bdd2 = bdd2;
+                this->result = result;
             }
         };
 
-        std::unique_ptr<ctnode[], ctnode_free> table;
+        std::unique_ptr<ctnode[]> table;
+        std::unique_ptr<uint64_t[]> lockbits;
 
         static constexpr uint32_t hash(node_handle bdd1, node_handle bdd2, uint32_t op)
         {
@@ -213,11 +211,12 @@ private:
 
         void acquire(uint32_t i)
         {
+            uint32_t bits_index = i >> 6;
+            uint32_t bit_index = i - (bits_index << 6);
+            uint64_t bit = 1ULL << bit_index;
             for (;;)
             {
-                uint32_t old_op = table[i].op & ~0x80000000;
-                uint32_t new_op = table[i].op & 0x80000000;
-                if (!(InterlockedCompareExchange(&table[i].op, new_op, old_op) & 0x80000000))
+                if (!(InterlockedOr64((LONGLONG*)&lockbits[bits_index], bit) & bit))
                 {
                     break;
                 }
@@ -226,41 +225,50 @@ private:
 
         void release(uint32_t i)
         {
-            InterlockedExchange(&table[i].op, table[i].op & ~0x80000000);
+            uint32_t bits_index = i >> 6;
+            uint32_t bit_index = i - (bits_index << 6);
+            uint64_t bit = 1ULL << bit_index;
+            InterlockedAnd64((LONGLONG*)&lockbits[bits_index], ~bit);
         }
 
     public:
         computed_table()
         {
-            table.reset((ctnode*)_aligned_malloc(sizeof(ctnode) * capacity, alignof(ctnode)));
+            table.reset(new ctnode[capacity]);
             for (uint32_t i = 0; i < capacity; i++)
             {
                 table[i].bdd1 = invalid_handle;
-                table[i].op = 0;
+            }
+
+            lockbits.reset(new uint64_t[capacity / 64]);
+            for (uint32_t i = 0; i < capacity / 64; i++)
+            {
+                lockbits[i] = 0;
             }
         }
 
         node_handle find(node_handle bdd1, node_handle bdd2, uint32_t op)
         {
             uint32_t h = hash(bdd1, bdd2, op);
-            
-            node_handle result;
+
+            ctnode found;
 
             acquire(h);
             {
-                ctnode found = table[h];
-                if (found.bdd1 == bdd1 &&
-                    found.bdd2 == bdd2 &&
-                    found.op == op)
-                {
-                    result = found.result;
-                }
-                else
-                {
-                    result = invalid_handle;
-                }
+                found = table[h];
             }
             release(h);
+
+            node_handle result;
+
+            if (found.bdd1 == bdd1 && found.bdd2 == bdd2 && found.op == op)
+            {
+                result = found.result;
+            }
+            else
+            {
+                result = invalid_handle;
+            }
 
             return result;
         }
@@ -269,9 +277,11 @@ private:
         {
             uint32_t h = hash(bdd1, bdd2, op);
             
+            ctnode newnode = ctnode(op, bdd1, bdd2, r);
+
             acquire(h);
             {
-                table[h] = ctnode{ op, bdd1, bdd2, r };
+                table[h] = newnode;
             }
             release(h);
         }
