@@ -1,9 +1,15 @@
-n = 11
+n = 12
 
 title = tostring(n) .. '-queens problem'
 
 function cellname(row, col)
     return 'r' .. tostring(row) .. 'c' .. tostring(col)
+end
+
+for row=1,n do
+    for col=1,n do
+        _ = input[cellname(row,col)]
+    end
 end
 
 board = true
