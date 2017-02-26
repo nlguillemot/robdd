@@ -36,7 +36,6 @@
 #ifdef ITTPROFILE
 __itt_domain* robdd_itt_domain = __itt_domain_create(L"robdd");
 __itt_string_handle* robdd_itt_decode_task = __itt_string_handle_create(L"decode");
-__itt_string_handle* robdd_itt_apply_task = __itt_string_handle_create(L"apply");
 #endif
 
 class robdd
@@ -69,42 +68,22 @@ private:
 
         static const uint32_t bddutmask = capacity - 1;
 
-        union poolnode
-        {
-            node data;
-            node_handle next;
-        };
-        std::unique_ptr<poolnode[]> pool;
+        std::unique_ptr<node[]> data_pool;
 
         uint32_t pool_head;
 
         node* pool_alloc()
         {
-            for (;;)
+            static_assert(sizeof(pool_head) == sizeof(LONG), "");
+            uint32_t old_head = InterlockedAdd((LONG*)&pool_head, 1);
+            
+            if (old_head >= capacity)
             {
-                uint32_t old_head = pool_head;
-
-                if (old_head == invalid_handle)
-                {
-                    printf("pool_alloc failed\n");
-                    std::abort();
-                }
-
-                uint32_t new_head;
-                new_head = pool[old_head].next;
-
-                // need to also compare that the new head didn't change
-                if (InterlockedCompareExchange(&pool_head, new_head, old_head) == old_head)
-                {
-                    return &pool[old_head].data;
-                }
+                printf("pool_alloc failed\n");
+                std::abort();
             }
-        }
 
-        void pool_free(const node* n)
-        {
-            // This is tough to implement because of the ABA problem.
-            // Thankfully it only gets called in rare circumstances, so let's just give up let the memory leak.
+            return &data_pool[old_head];
         }
 
         std::unique_ptr<node_handle[]> table;
@@ -114,18 +93,13 @@ private:
 
         node_handle to_handle(const node* n) const
         {
-            return node_handle((poolnode*)n - &pool[0]);
+            return node_handle(n - &data_pool[0]);
         }
 
     public:
         unique_table()
         {
-            pool.reset(new poolnode[capacity]);
-            for (uint32_t i = 0; i < capacity; i++)
-            {
-                pool[i].next = i + 1;
-            }
-            pool[capacity - 1].next = invalid_handle;
+            data_pool.reset(new node[capacity]);
             pool_head = 0;
 
             table.reset(new node_handle[capacity]);
@@ -155,17 +129,17 @@ private:
 
         uint32_t get_var(node_handle h) const
         {
-            return pool[h].data.var;
+            return data_pool[h].var;
         }
 
         node_handle get_lo(node_handle h) const
         {
-            return pool[h].data.lo;
+            return data_pool[h].lo;
         }
 
         node_handle get_hi(node_handle h) const
         {
-            return pool[h].data.hi;
+            return data_pool[h].hi;
         }
 
         node_handle insert(uint32_t var, node_handle lo, node_handle hi)
@@ -178,7 +152,7 @@ private:
                     uint32_t tab = table[p];
                     if (tab != invalid_handle)
                     {
-                        const node* curr = &pool[tab].data;
+                        const node* curr = &data_pool[tab];
                         if (curr->var == var && curr->lo == lo && curr->hi == hi)
                         {
                             return to_handle(curr);
@@ -200,11 +174,8 @@ private:
                 {
                     return handle;
                 }
-                else
-                {
-                    pool_free(new_node);
-                    continue;
-                }
+
+                // leak the node
             }
         }
     };
@@ -394,10 +365,6 @@ public:
 #ifndef SINGLETHREADED
         if (level < max_level)
         {
-#ifdef ITTPROFILE
-            __itt_task_begin(robdd_itt_domain, __itt_null, __itt_null, robdd_itt_apply_task);
-#endif
-
             tbb::task_group g;
             node_handle lo, hi;
 
@@ -419,10 +386,6 @@ public:
                 g.run_and_wait([&] { hi = apply(bdd1, get_hi(bdd2), op, level + 1); });
                 n = make_node(get_var(bdd2), lo, hi);
             }
-
-#ifdef ITTPROFILE
-            __itt_task_end(robdd_itt_domain);
-#endif
         }
         else
 #endif
@@ -536,6 +499,9 @@ void decode(
     {
         const bdd_instr& inst = instrs[i];
 
+        // run the first few instructions single-threaded since they don't do much work
+        uint32_t level = i < 100 ? 99999999 : 0;
+
         int inst_dst_ast_id = -1;
         robdd::node_handle inst_dst_node = robdd::invalid_handle;
 
@@ -566,7 +532,7 @@ void decode(
 
             robdd::node_handle src1_bdd = ast2bdd[src1_ast_id];
             robdd::node_handle src2_bdd = ast2bdd[src2_ast_id];
-            robdd::node_handle new_bdd = r->apply(src1_bdd, src2_bdd, robdd::opcode::bdd_and, 0);
+            robdd::node_handle new_bdd = r->apply(src1_bdd, src2_bdd, robdd::opcode::bdd_and, level);
 
             ast2bdd[dst_ast_id] = new_bdd;
 
@@ -584,7 +550,7 @@ void decode(
 
             robdd::node_handle src1_bdd = ast2bdd[src1_ast_id];
             robdd::node_handle src2_bdd = ast2bdd[src2_ast_id];
-            robdd::node_handle new_bdd = r->apply(src1_bdd, src2_bdd, robdd::opcode::bdd_or, 0);
+            robdd::node_handle new_bdd = r->apply(src1_bdd, src2_bdd, robdd::opcode::bdd_or, level);
 
             ast2bdd[dst_ast_id] = new_bdd;
 
@@ -602,7 +568,7 @@ void decode(
 
             robdd::node_handle src1_bdd = ast2bdd[src1_ast_id];
             robdd::node_handle src2_bdd = ast2bdd[src2_ast_id];
-            robdd::node_handle new_bdd = r->apply(src1_bdd, src2_bdd, robdd::opcode::bdd_xor, 0);
+            robdd::node_handle new_bdd = r->apply(src1_bdd, src2_bdd, robdd::opcode::bdd_xor, level);
 
             ast2bdd[dst_ast_id] = new_bdd;
 
@@ -618,7 +584,7 @@ void decode(
             // printf("%d = NOT %d\n", dst_ast_id, src_ast_id);
 
             robdd::node_handle src_bdd = ast2bdd[src_ast_id];
-            robdd::node_handle new_bdd = r->apply(src_bdd, true_node, robdd::opcode::bdd_xor, 0);
+            robdd::node_handle new_bdd = r->apply(src_bdd, true_node, robdd::opcode::bdd_xor, level);
 
             ast2bdd[dst_ast_id] = new_bdd;
 
