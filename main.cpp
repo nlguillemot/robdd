@@ -12,8 +12,6 @@
 #define NOMINMAX
 #include <Windows.h>
 
-#include <intrin.h>
-
 #include <lua.hpp>
 #include <lauxlib.h>
 #include <lualib.h>
@@ -213,6 +211,24 @@ private:
             return bddctmask & (bdd1 + bdd2 + op);
         }
 
+        void acquire(uint32_t i)
+        {
+            for (;;)
+            {
+                uint32_t old_op = table[i].op & ~0x80000000;
+                uint32_t new_op = table[i].op & 0x80000000;
+                if (!(InterlockedCompareExchange(&table[i].op, new_op, old_op) & 0x80000000))
+                {
+                    break;
+                }
+            }
+        }
+
+        void release(uint32_t i)
+        {
+            InterlockedExchange(&table[i].op, table[i].op & ~0x80000000);
+        }
+
     public:
         computed_table()
         {
@@ -230,10 +246,12 @@ private:
             
             node_handle result;
 
-            if (_xbegin() == _XBEGIN_STARTED)
+            acquire(h);
             {
                 ctnode found = table[h];
-                if (found.bdd1 == bdd1 && found.bdd2 == bdd2 && found.op == op)
+                if (found.bdd1 == bdd1 &&
+                    found.bdd2 == bdd2 &&
+                    found.op == op)
                 {
                     result = found.result;
                 }
@@ -241,12 +259,8 @@ private:
                 {
                     result = invalid_handle;
                 }
-                _xend();
             }
-            else
-            {
-                result = invalid_handle;
-            }
+            release(h);
 
             return result;
         }
@@ -255,11 +269,11 @@ private:
         {
             uint32_t h = hash(bdd1, bdd2, op);
             
-            if (_xbegin() == _XBEGIN_STARTED)
+            acquire(h);
             {
                 table[h] = ctnode{ op, bdd1, bdd2, r };
-                _xend();
             }
+            release(h);
         }
     };
 
