@@ -5,7 +5,12 @@
 // * Improve the hashtable data-structure (used to have unique nodes)
 // * Improve the cache data-structure (used to avoid recomputing the ITE)
 
-#include <tbb/task.h>
+#include <tbb/task_scheduler_init.h>
+#include <tbb/task_group.h>
+
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <Windows.h>
 
 #include <lua.hpp>
 #include <lauxlib.h>
@@ -55,27 +60,38 @@ private:
             node_handle next;
         };
         std::unique_ptr<poolnode[]> pool;
-        node_handle pool_head;
+
+        uint32_t pool_head;
 
         node* pool_alloc()
         {
-            if (pool_head == invalid_handle)
+            for (;;)
             {
-                printf("pool_alloc failed\n");
-                std::abort();
+                MemoryBarrier();
+
+                uint32_t old_head = pool_head;
+
+                if (old_head == invalid_handle)
+                {
+                    printf("pool_alloc failed\n");
+                    std::abort();
+                }
+
+                uint32_t new_head;
+                new_head = pool[old_head].next;
+
+                // need to also compare that the new head didn't change
+                if (InterlockedCompareExchange(&pool_head, new_head, old_head) == old_head)
+                {
+                    return &pool[old_head].data;
+                }
             }
-
-            node_handle head = pool_head;
-            pool_head = pool[head].next;
-
-            return &pool[head].data;
         }
 
         void pool_free(const node* n)
         {
-            poolnode* p = (poolnode*)n;
-            p->next = pool_head;
-            pool_head = to_handle(n);
+            // This is tough to implement because of the ABA problem.
+            // Thankfully it only gets called in rare circumstances, so let's just give up let the memory leak.
         }
 
         std::unique_ptr<node_handle[]> table;
@@ -142,24 +158,40 @@ private:
         node_handle insert(uint32_t var, node_handle lo, node_handle hi)
         {
             uint32_t p = bddutmask & (var + lo + hi);
-            
-            while (table[p] != invalid_handle)
-            {
-                const node* curr = &pool[table[p]].data;
-                if (curr->var == var && curr->lo == lo && curr->hi == hi)
-                {
-                    return to_handle(curr);
-                }
-                p = (p + 1) & bddutmask;
-            }
 
-            node* new_node = pool_alloc();
-            new_node->var = var;
-            new_node->lo = lo;
-            new_node->hi = hi;
-            node_handle handle = to_handle(new_node);
-            table[p] = handle;
-            return handle;
+            for (;;)
+            {
+                MemoryBarrier();
+
+                if (table[p] != invalid_handle)
+                {
+                    const node* curr = &pool[table[p]].data;
+                    if (curr->var == var && curr->lo == lo && curr->hi == hi)
+                    {
+                        return to_handle(curr);
+                    }
+                    p = (p + 1) & bddutmask;
+                    continue;
+                }
+
+                node* new_node = pool_alloc();
+                new_node->var = var;
+                new_node->lo = lo;
+                new_node->hi = hi;
+                node_handle handle = to_handle(new_node);
+
+                node_handle previous_handle = InterlockedCompareExchange(&table[p], handle, invalid_handle);
+
+                if (previous_handle == invalid_handle)
+                {
+                    return handle;
+                }
+                else
+                {
+                    pool_free(new_node);
+                    continue;
+                }
+            }
         }
     };
 
@@ -170,51 +202,93 @@ private:
 
         static const uint32_t bddctmask = capacity - 1;
 
+        __declspec(align(64))
         struct ctnode
         {
+            uint32_t op;
             node_handle bdd1;
             node_handle bdd2;
-            node_handle op;
             node_handle result;
         };
 
-        std::unique_ptr<ctnode[]> table;
+        struct ctnode_free
+        {
+            void operator()(ctnode* n)
+            {
+                _aligned_free(n);
+            }
+        };
+
+        std::unique_ptr<ctnode[], ctnode_free> table;
 
         static constexpr uint32_t hash(node_handle bdd1, node_handle bdd2, uint32_t op)
         {
             return bddctmask & (bdd1 + bdd2 + op);
         }
 
+        void acquire(uint32_t i)
+        {
+            for (;;)
+            {
+                uint32_t old_op = table[i].op & ~0x80000000;
+                uint32_t new_op = table[i].op & 0x80000000;
+                if (!(InterlockedCompareExchange(&table[i].op, new_op, old_op) & 0x80000000))
+                {
+                    break;
+                }
+            }
+        }
+
+        void release(uint32_t i)
+        {
+            InterlockedExchange(&table[i].op, table[i].op & ~0x80000000);
+        }
+
     public:
         computed_table()
         {
-            table.reset(new ctnode[capacity]);
+            table.reset((ctnode*)_aligned_malloc(sizeof(ctnode) * capacity, alignof(ctnode)));
             for (uint32_t i = 0; i < capacity; i++)
             {
                 table[i].bdd1 = invalid_handle;
+                table[i].op = 0;
             }
         }
 
         node_handle find(node_handle bdd1, node_handle bdd2, uint32_t op)
         {
             uint32_t h = hash(bdd1, bdd2, op);
-            ctnode found = table[h];
-            if (found.bdd1 == bdd1 &&
-                found.bdd2 == bdd2 &&
-                found.op == op) 
+            
+            node_handle result;
+
+            acquire(h);
             {
-                return found.result;
+                ctnode found = table[h];
+                if (found.bdd1 == bdd1 &&
+                    found.bdd2 == bdd2 &&
+                    found.op == op)
+                {
+                    result = found.result;
+                }
+                else
+                {
+                    result = invalid_handle;
+                }
             }
-            else
-            {
-                return invalid_handle;
-            }
+            release(h);
+
+            return result;
         }
 
         void insert(node_handle bdd1, node_handle bdd2, uint32_t op, node_handle r)
         {
             uint32_t h = hash(bdd1, bdd2, op);
-            table[h] = ctnode{ bdd1, bdd2, op, r };
+            
+            acquire(h);
+            {
+                table[h] = ctnode{ op, bdd1, bdd2, r };
+            }
+            release(h);
         }
     };
 
@@ -225,11 +299,15 @@ private:
 
     computed_table computedtb;
 
+    uint32_t max_level;
+
 public:
     robdd()
     {
         false_node = uniquetb.get_false();
         true_node = uniquetb.get_true();
+
+        max_level = tbb::task_scheduler_init::default_num_threads() - 1;
     }
 
     node_handle get_false() const
@@ -267,7 +345,7 @@ public:
         return uniquetb.insert(var, lo, hi);
     }
 
-    node_handle apply(node_handle bdd1, node_handle bdd2, uint32_t op)
+    node_handle apply(node_handle bdd1, node_handle bdd2, uint32_t op, uint32_t level)
     {
         node_handle found = computedtb.find(bdd1, bdd2, op);
         if (found != invalid_handle)
@@ -295,22 +373,52 @@ public:
         }
         
         node_handle n;
-        if (get_var(bdd1) == get_var(bdd2))
+        
+        if (level >= max_level)
         {
-            node_handle lo = apply(get_lo(bdd1), get_lo(bdd2), op);
-            node_handle hi = apply(get_hi(bdd1), get_hi(bdd2), op);
-            n = make_node(get_var(bdd1), lo, hi);
+            node_handle lo, hi;
+            if (get_var(bdd1) == get_var(bdd2))
+            {
+                lo = apply(get_lo(bdd1), get_lo(bdd2), op, level);
+                hi = apply(get_hi(bdd1), get_hi(bdd2), op, level);
+                n = make_node(get_var(bdd1), lo, hi);
+            }
+            else if (get_var(bdd1) < get_var(bdd2))
+            {
+                lo = apply(get_lo(bdd1), bdd2, op, level);
+                hi = apply(get_hi(bdd1), bdd2, op, level);
+                n = make_node(get_var(bdd1), lo, hi);
+            }
+            else
+            {
+                lo = apply(bdd1, get_lo(bdd2), op, level);
+                hi = apply(bdd1, get_hi(bdd2), op, level);
+                n = make_node(get_var(bdd2), lo, hi);
+            }
         }
-        else if (get_var(bdd1) < get_var(bdd2))
+        else
         {
-            node_handle lo = apply(get_lo(bdd1), bdd2, op);
-            node_handle hi = apply(get_hi(bdd1), bdd2, op);
-            n = make_node(get_var(bdd1), lo, hi);
-        }
-        else {
-            node_handle lo = apply(bdd1, get_lo(bdd2), op);
-            node_handle hi = apply(bdd1, get_hi(bdd2), op);
-            n = make_node(get_var(bdd2), lo, hi);
+            tbb::task_group g;
+            node_handle lo, hi;
+
+            if (get_var(bdd1) == get_var(bdd2))
+            {
+                g.run([&] { lo = apply(get_lo(bdd1), get_lo(bdd2), op, level + 1); });
+                g.run_and_wait([&] { hi = apply(get_hi(bdd1), get_hi(bdd2), op, level + 1); });
+                n = make_node(get_var(bdd1), lo, hi);
+            }
+            else if (get_var(bdd1) < get_var(bdd2))
+            {
+                g.run([&] { lo = apply(get_lo(bdd1), bdd2, op, level + 1); });
+                g.run_and_wait([&] { hi = apply(get_hi(bdd1), bdd2, op, level + 1); });
+                n = make_node(get_var(bdd1), lo, hi);
+            }
+            else
+            {
+                g.run([&] { lo = apply(bdd1, get_lo(bdd2), op, level + 1); });
+                g.run_and_wait([&] { hi = apply(bdd1, get_hi(bdd2), op, level + 1); });
+                n = make_node(get_var(bdd2), lo, hi);
+            }
         }
 
         computedtb.insert(bdd1, bdd2, op, n);
@@ -407,7 +515,7 @@ void decode(
             int ast_id = inst.operand_newinput_id;
             const char* ast_name = inst.operand_newinput_name->c_str();
 
-            printf("new %d (%s)\n", ast_id, ast_name);
+            // printf("new %d (%s)\n", ast_id, ast_name);
 
             robdd::node_handle new_bdd = r->make_node(ast_id, false_node, true_node);
 
@@ -423,11 +531,11 @@ void decode(
             int dst_ast_id  = inst.operand_and_dst_id;
             int src1_ast_id = inst.operand_and_src1_id;
             int src2_ast_id = inst.operand_and_src2_id;
-            printf("%d = %d AND %d\n", dst_ast_id, src1_ast_id, src2_ast_id);
+            // printf("%d = %d AND %d\n", dst_ast_id, src1_ast_id, src2_ast_id);
 
             robdd::node_handle src1_bdd = ast2bdd[src1_ast_id];
             robdd::node_handle src2_bdd = ast2bdd[src2_ast_id];
-            robdd::node_handle new_bdd = r->apply(src1_bdd, src2_bdd, robdd::opcode::bdd_and);
+            robdd::node_handle new_bdd = r->apply(src1_bdd, src2_bdd, robdd::opcode::bdd_and, 0);
 
             ast2bdd[dst_ast_id] = new_bdd;
 
@@ -441,11 +549,11 @@ void decode(
             int dst_ast_id  = inst.operand_or_dst_id;
             int src1_ast_id = inst.operand_or_src1_id;
             int src2_ast_id = inst.operand_or_src2_id;
-            printf("%d = %d OR %d\n", dst_ast_id, src1_ast_id, src2_ast_id);
+            // printf("%d = %d OR %d\n", dst_ast_id, src1_ast_id, src2_ast_id);
 
             robdd::node_handle src1_bdd = ast2bdd[src1_ast_id];
             robdd::node_handle src2_bdd = ast2bdd[src2_ast_id];
-            robdd::node_handle new_bdd = r->apply(src1_bdd, src2_bdd, robdd::opcode::bdd_or);
+            robdd::node_handle new_bdd = r->apply(src1_bdd, src2_bdd, robdd::opcode::bdd_or, 0);
 
             ast2bdd[dst_ast_id] = new_bdd;
 
@@ -459,11 +567,11 @@ void decode(
             int dst_ast_id = inst.operand_xor_dst_id;
             int src1_ast_id = inst.operand_xor_src1_id;
             int src2_ast_id = inst.operand_xor_src2_id;
-            printf("%d = %d XOR %d\n", dst_ast_id, src1_ast_id, src2_ast_id);
+            // printf("%d = %d XOR %d\n", dst_ast_id, src1_ast_id, src2_ast_id);
 
             robdd::node_handle src1_bdd = ast2bdd[src1_ast_id];
             robdd::node_handle src2_bdd = ast2bdd[src2_ast_id];
-            robdd::node_handle new_bdd = r->apply(src1_bdd, src2_bdd, robdd::opcode::bdd_xor);
+            robdd::node_handle new_bdd = r->apply(src1_bdd, src2_bdd, robdd::opcode::bdd_xor, 0);
 
             ast2bdd[dst_ast_id] = new_bdd;
 
@@ -476,10 +584,10 @@ void decode(
         {
             int dst_ast_id = inst.operand_not_dst_id;
             int src_ast_id = inst.operand_not_src_id;
-            printf("%d = NOT %d\n", dst_ast_id, src_ast_id);
+            // printf("%d = NOT %d\n", dst_ast_id, src_ast_id);
 
             robdd::node_handle src_bdd = ast2bdd[src_ast_id];
-            robdd::node_handle new_bdd = r->apply(src_bdd, true_node, robdd::opcode::bdd_xor);
+            robdd::node_handle new_bdd = r->apply(src_bdd, true_node, robdd::opcode::bdd_xor, 0);
 
             ast2bdd[dst_ast_id] = new_bdd;
 
@@ -867,12 +975,40 @@ int main(int argc, char* argv[])
     robdd bdd;
     std::vector<robdd::node_handle> roots(root_ast_ids.size());
 
+    printf("decoding...\n");
+
+    LARGE_INTEGER now, then, freq;
+    QueryPerformanceFrequency(&freq);
+
+    QueryPerformanceCounter(&then);
+
     decode(
         (int)g_bdd_instructions.size(), g_bdd_instructions.data(),
         g_next_ast_id - ast_id_user, // num user ast nodes
         (int)root_ast_ids.size(), root_ast_ids.data(),
         &bdd,
         roots.data());
+
+    QueryPerformanceCounter(&now);
+
+    UINT64 seconds = (now.QuadPart - then.QuadPart) / freq.QuadPart;
+    UINT64 milliseconds = (now.QuadPart - then.QuadPart) * 1000 / freq.QuadPart;
+    UINT64 microseconds = (now.QuadPart - then.QuadPart) * 1000000 / freq.QuadPart;
+
+    if (seconds > 0)
+    {
+        printf("Finished in %.3lf seconds\n", double(now.QuadPart - then.QuadPart) / freq.QuadPart);
+    }
+    else if (milliseconds > 0)
+    {
+        printf("Finished in %.3lf milliseconds\n", double(now.QuadPart - then.QuadPart) * 1000.0 / freq.QuadPart);
+    }
+    else
+    {
+        printf("Finished in %.3lf microseconds\n", double(now.QuadPart - then.QuadPart) * 1000000.0 / freq.QuadPart);
+    }
+
+    printf("writing dot file...\n");
 
     write_dot(
         title,
