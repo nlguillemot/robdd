@@ -102,4 +102,4 @@ connections = {
     [47]={}
 }
 
-output.coloring = coloring.color(connections, names)
+output.coloring = coloring.color(connections, 4, names)
