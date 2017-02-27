@@ -1,4 +1,5 @@
 title = 'test'
+display = true
 
 a = input.a
 b = input.b

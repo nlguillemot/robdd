@@ -1,6 +1,3 @@
-// TODO:
-// * Count the number of solutions and output a sample solution
-
 #include <tbb/task_scheduler_init.h>
 #include <tbb/task_group.h>
 
@@ -15,14 +12,13 @@
 #include <map>
 #include <unordered_set>
 #include <vector>
-#include <tuple>
 #include <string>
 #include <cassert>
 #include <cstdlib>
 
 //#define SINGLETHREADED
 
-#define USE_TSX
+//#define USE_TSX
 
 #define ITTPROFILE
 
@@ -59,6 +55,7 @@ private:
             uint32_t var;
             node_handle lo;
             node_handle hi;
+            uint64_t weight;
         };
 
         static const uint32_t capacity = 0x8000000;
@@ -72,7 +69,6 @@ private:
 
         node* pool_alloc()
         {
-            static_assert(sizeof(pool_head) == sizeof(LONG), "");
             uint32_t old_head = InterlockedAdd((LONG*)&pool_head, 1);
             
             if (old_head >= capacity)
@@ -109,10 +105,12 @@ private:
             false_node = pool_alloc();
             false_node->var = INT_MAX;
             false_node->lo = false_node->hi = to_handle(false_node);
+            false_node->weight = 0;
 
             true_node = pool_alloc();
             true_node->var = INT_MAX - 1;
             true_node->lo = true_node->hi = to_handle(true_node);
+            true_node->weight = 1;
         }
 
         node_handle get_false() const
@@ -140,6 +138,11 @@ private:
             return data_pool[h].hi;
         }
 
+        uint64_t get_weight(node_handle h) const
+        {
+            return data_pool[h].weight;
+        }
+
         node_handle insert(uint32_t var, node_handle lo, node_handle hi)
         {
             uint32_t p = bddutmask & (var + lo + hi);
@@ -164,8 +167,16 @@ private:
                 new_node->var = var;
                 new_node->lo = lo;
                 new_node->hi = hi;
+                // combine weights
+                {
+                    const node* lonode = &data_pool[lo];
+                    const node* hinode = &data_pool[hi];
+                    uint64_t loweight = lonode->var >= INT_MAX - 1 ? lonode->weight : (1ULL << (lonode->var - var - 1)) * lonode->weight;
+                    uint64_t hiweight = hinode->var >= INT_MAX - 1 ? hinode->weight : (1ULL << (hinode->var  - var - 1)) * hinode->weight;
+                    new_node->weight = loweight + hiweight;
+                }
+                
                 node_handle handle = to_handle(new_node);
-
                 node_handle previous_handle = InterlockedCompareExchange(&table[p], handle, invalid_handle);
 
                 if (previous_handle == invalid_handle)
@@ -353,6 +364,11 @@ public:
     node_handle get_hi(node_handle h) const
     {
         return uniquetb.get_hi(h);
+    }
+
+    uint64_t get_weight(node_handle h) const
+    {
+        return uniquetb.get_weight(h);
     }
 
     node_handle make_node(uint32_t var, node_handle lo, node_handle hi)
@@ -700,7 +716,7 @@ void write_dot(
 
     for (int root_idx = 0; root_idx < num_roots; root_idx++)
     {
-        fprintf(f, "  r%d [label=\"%s\",style=filled];\n", root_idx, root_names[root_idx].c_str());
+        fprintf(f, "  r%d [label=\"%s\\n%llu solutions\",style=filled];\n", root_idx, root_names[root_idx].c_str(), r->get_weight(roots[root_idx]));
         fprintf(f, "  r%d -> n%x [style=solid];\n", root_idx, roots[root_idx]);
     }
 
@@ -1005,6 +1021,10 @@ int main(int argc, char* argv[])
     const char* title = lua_isstring(L, -1) ? lua_tostring(L, -1) : infile;
     lua_pop(L, 1);
 
+    lua_getglobal(L, "display");
+    bool display = lua_isboolean(L, -1) ? lua_toboolean(L, -1) != 0: false;
+    lua_pop(L, 1);
+
     robdd bdd;
     std::vector<robdd::node_handle> roots(root_ast_ids.size());
 
@@ -1041,13 +1061,19 @@ int main(int argc, char* argv[])
         printf("Finished in %.3lf microseconds\n", double(now.QuadPart - then.QuadPart) * 1000000.0 / freq.QuadPart);
     }
 
-    return 0;
+    for (int root_idx = 0; root_idx < (int)root_ast_ids.size(); root_idx++)
+    {
+        printf("Found %llu solution to \"%s\"\n", bdd.get_weight(roots[root_idx]), root_ast_names[root_idx].c_str());
+    }
 
-    printf("writing dot file...\n");
+    if (display)
+    {
+        printf("writing dot file...\n");
 
-    write_dot(
-        title,
-        (int)roots.size(), roots.data(), root_ast_names.data(),
-        &bdd,
-        outfile);
+        write_dot(
+            title,
+            (int)roots.size(), roots.data(), root_ast_names.data(),
+            &bdd,
+            outfile);
+    }
 }

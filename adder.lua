@@ -1,4 +1,5 @@
 n = 2
+display = true
 
 title = tostring(n) .. '-bit ripple carry adder'
 

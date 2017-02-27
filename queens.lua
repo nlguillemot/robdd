@@ -1,5 +1,7 @@
 n = 12
 
+display = n <= 6
+
 title = tostring(n) .. '-queens problem'
 
 function cellname(row, col)
