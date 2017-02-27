@@ -85,6 +85,7 @@
     <None Include="coloring.lua" />
     <None Include="japan.lua" />
     <None Include="packages.config" />
+    <None Include="petersen.lua" />
     <None Include="queens.lua" />
     <None Include="test.lua" />
     <None Include="usa.lua" />

@@ -11,5 +11,6 @@
     <None Include="japan.lua" />
     <None Include="coloring.lua" />
     <None Include="usa.lua" />
+    <None Include="petersen.lua" />
   </ItemGroup>
 </Project>

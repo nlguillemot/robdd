@@ -12,9 +12,13 @@
 #include <map>
 #include <unordered_set>
 #include <vector>
+#include <tuple>
 #include <string>
 #include <cassert>
 #include <cstdlib>
+#include <array>
+
+//#define SHOW_INSTRS
 
 //#define SINGLETHREADED
 
@@ -43,7 +47,7 @@ public:
         enum {
             bdd_and,
             bdd_or,
-            bdd_xor
+            bdd_xor,
         };
     };
 
@@ -69,7 +73,7 @@ private:
 
         node* pool_alloc()
         {
-            uint32_t old_head = InterlockedAdd((LONG*)&pool_head, 1);
+            uint32_t old_head = InterlockedExchangeAdd((LONG*)&pool_head, 1);
             
             if (old_head >= capacity)
             {
@@ -89,9 +93,14 @@ private:
         {
             return node_handle(n - &data_pool[0]);
         }
+        
+        const node* to_node(node_handle h) const
+        {
+            return (const node*)&data_pool[h];
+        }
 
     public:
-        unique_table()
+        void init(uint32_t num_vars)
         {
             data_pool.reset(new node[capacity]);
             pool_head = 0;
@@ -103,12 +112,12 @@ private:
             }
 
             false_node = pool_alloc();
-            false_node->var = INT_MAX;
+            false_node->var = num_vars;
             false_node->lo = false_node->hi = to_handle(false_node);
             false_node->weight = 0;
 
             true_node = pool_alloc();
-            true_node->var = INT_MAX - 1;
+            true_node->var = num_vars;
             true_node->lo = true_node->hi = to_handle(true_node);
             true_node->weight = 1;
         }
@@ -125,22 +134,22 @@ private:
 
         uint32_t get_var(node_handle h) const
         {
-            return data_pool[h].var;
+            return to_node(h)->var;
         }
 
         node_handle get_lo(node_handle h) const
         {
-            return data_pool[h].lo;
+            return to_node(h)->lo;
         }
 
         node_handle get_hi(node_handle h) const
         {
-            return data_pool[h].hi;
+            return to_node(h)->hi;
         }
 
         uint64_t get_weight(node_handle h) const
         {
-            return data_pool[h].weight;
+            return to_node(h)->weight;
         }
 
         node_handle insert(uint32_t var, node_handle lo, node_handle hi)
@@ -153,7 +162,7 @@ private:
                     uint32_t tab = table[p];
                     if (tab != invalid_handle)
                     {
-                        const node* curr = &data_pool[tab];
+                        const node* curr = to_node(tab);
                         if (curr->var == var && curr->lo == lo && curr->hi == hi)
                         {
                             return to_handle(curr);
@@ -169,13 +178,13 @@ private:
                 new_node->hi = hi;
                 // combine weights
                 {
-                    const node* lonode = &data_pool[lo];
-                    const node* hinode = &data_pool[hi];
-                    uint64_t loweight = lonode->var >= INT_MAX - 1 ? lonode->weight : (1ULL << (lonode->var - var - 1)) * lonode->weight;
-                    uint64_t hiweight = hinode->var >= INT_MAX - 1 ? hinode->weight : (1ULL << (hinode->var  - var - 1)) * hinode->weight;
+                    const node* lonode = to_node(lo);
+                    const node* hinode = to_node(hi);
+                    uint64_t loweight = (1ULL << (lonode->var - var - 1)) * lonode->weight;
+                    uint64_t hiweight = (1ULL << (hinode->var - var - 1)) * hinode->weight;
                     new_node->weight = loweight + hiweight;
                 }
-                
+
                 node_handle handle = to_handle(new_node);
                 node_handle previous_handle = InterlockedCompareExchange(&table[p], handle, invalid_handle);
 
@@ -330,8 +339,10 @@ private:
     uint32_t max_level;
 
 public:
-    robdd()
+    robdd(uint32_t num_vars)
     {
+        uniquetb.init(num_vars);
+
         false_node = uniquetb.get_false();
         true_node = uniquetb.get_true();
 
@@ -480,7 +491,8 @@ struct bdd_instr
     union
     {
         struct {
-            int operand_newinput_id;
+            int operand_newinput_ast_id;
+            int operand_newinput_var_id;
             const std::string* operand_newinput_name;
         };
 
@@ -505,6 +517,11 @@ struct bdd_instr
         struct {
             int operand_not_dst_id;
             int operand_not_src_id;
+        };
+
+        struct {
+            int operand_dontcare_dst_id;
+            int operand_dontcare_src_id;
         };
     };
 };
@@ -557,12 +574,15 @@ void decode(
         {
         case bdd_instr::opcode_newinput:
         {
-            int ast_id = inst.operand_newinput_id;
+            int ast_id = inst.operand_newinput_ast_id;
+            int var_id = inst.operand_newinput_var_id;
             const char* ast_name = inst.operand_newinput_name->c_str();
 
-            // printf("new %d (%s)\n", ast_id, ast_name);
+#ifdef SHOW_INSTRS
+            printf("new %d (%s)\n", ast_id, ast_name);
+#endif
 
-            robdd::node_handle new_bdd = r->make_node(ast_id, false_node, true_node);
+            robdd::node_handle new_bdd = r->make_node(var_id, false_node, true_node);
 
             ast2bdd[ast_id] = new_bdd;
 
@@ -576,7 +596,10 @@ void decode(
             int dst_ast_id  = inst.operand_and_dst_id;
             int src1_ast_id = inst.operand_and_src1_id;
             int src2_ast_id = inst.operand_and_src2_id;
-            // printf("%d = %d AND %d\n", dst_ast_id, src1_ast_id, src2_ast_id);
+
+#ifdef SHOW_INSTRS
+            printf("%d = %d AND %d\n", dst_ast_id, src1_ast_id, src2_ast_id);
+#endif
 
             robdd::node_handle src1_bdd = ast2bdd[src1_ast_id];
             robdd::node_handle src2_bdd = ast2bdd[src2_ast_id];
@@ -594,7 +617,10 @@ void decode(
             int dst_ast_id  = inst.operand_or_dst_id;
             int src1_ast_id = inst.operand_or_src1_id;
             int src2_ast_id = inst.operand_or_src2_id;
-            // printf("%d = %d OR %d\n", dst_ast_id, src1_ast_id, src2_ast_id);
+
+#ifdef SHOW_INSTRS
+            printf("%d = %d OR %d\n", dst_ast_id, src1_ast_id, src2_ast_id);
+#endif
 
             robdd::node_handle src1_bdd = ast2bdd[src1_ast_id];
             robdd::node_handle src2_bdd = ast2bdd[src2_ast_id];
@@ -612,7 +638,10 @@ void decode(
             int dst_ast_id = inst.operand_xor_dst_id;
             int src1_ast_id = inst.operand_xor_src1_id;
             int src2_ast_id = inst.operand_xor_src2_id;
-            // printf("%d = %d XOR %d\n", dst_ast_id, src1_ast_id, src2_ast_id);
+
+#ifdef SHOW_INSTRS
+            printf("%d = %d XOR %d\n", dst_ast_id, src1_ast_id, src2_ast_id);
+#endif
 
             robdd::node_handle src1_bdd = ast2bdd[src1_ast_id];
             robdd::node_handle src2_bdd = ast2bdd[src2_ast_id];
@@ -629,7 +658,10 @@ void decode(
         {
             int dst_ast_id = inst.operand_not_dst_id;
             int src_ast_id = inst.operand_not_src_id;
-            // printf("%d = NOT %d\n", dst_ast_id, src_ast_id);
+
+#ifdef SHOW_INSTRS
+            printf("%d = NOT %d\n", dst_ast_id, src_ast_id);
+#endif
 
             robdd::node_handle src_bdd = ast2bdd[src_ast_id];
             robdd::node_handle new_bdd = r->apply(src_bdd, true_node, robdd::opcode::bdd_xor, level);
@@ -659,7 +691,7 @@ void decode(
 #endif
 }
 
-std::map<int, std::string> g_astid2name;
+std::map<int, std::string> g_varid2name;
 
 void write_dot(
     const char* title,
@@ -708,7 +740,7 @@ void write_dot(
         }
         else
         {
-            fprintf(f, "  n%x [label=\"%s\"];\n", roots[root_idx], g_astid2name.at(r->get_var(roots[root_idx])).c_str());
+            fprintf(f, "  n%x [label=\"%s\"];\n", roots[root_idx], g_varid2name.at(r->get_var(roots[root_idx])).c_str());
         }
 
         declared.insert(roots[root_idx]);
@@ -743,7 +775,7 @@ void write_dot(
                 }
                 else
                 {
-                    fprintf(f, "  n%x [label=\"%s\"];\n", child, g_astid2name.at(r->get_var(child)).c_str());
+                    fprintf(f, "  n%x [label=\"%s\"];\n", child, g_varid2name.at(r->get_var(child)).c_str());
                 }
             }
 
@@ -770,6 +802,7 @@ void write_dot(
 
 std::vector<bdd_instr> g_bdd_instructions;
 int g_next_ast_id = ast_id_user;
+int g_num_variables = 0;
 
 int l_input_newindex(lua_State* L)
 {
@@ -783,12 +816,15 @@ int l_input_index(lua_State* L)
     *ast_id = g_next_ast_id;
     g_next_ast_id += 1;
 
-    auto astid2name = g_astid2name.emplace(*ast_id, luaL_checkstring(L, 2)).first;
+    auto varid2name = g_varid2name.emplace(g_num_variables, luaL_checkstring(L, 2)).first;
+    
+    g_num_variables += 1;
 
     bdd_instr new_instr;
     new_instr.opcode = bdd_instr::opcode_newinput;
-    new_instr.operand_newinput_id = *ast_id;
-    new_instr.operand_newinput_name = &astid2name->second;
+    new_instr.operand_newinput_ast_id = *ast_id;
+    new_instr.operand_newinput_var_id = varid2name->first;
+    new_instr.operand_newinput_name = &varid2name->second;
     g_bdd_instructions.push_back(new_instr);
 
     luaL_newmetatable(L, "ast");
@@ -962,7 +998,8 @@ int main(int argc, char* argv[])
 
     lua_newtable(L);
     lua_setglobal(L, "output");
-    
+
+
     if (luaL_dofile(L, infile))
     {
         printf("%s\n", lua_tostring(L, -1));
@@ -1025,7 +1062,7 @@ int main(int argc, char* argv[])
     bool display = lua_isboolean(L, -1) ? lua_toboolean(L, -1) != 0: false;
     lua_pop(L, 1);
 
-    robdd bdd;
+    robdd bdd(g_num_variables);
     std::vector<robdd::node_handle> roots(root_ast_ids.size());
 
     printf("decoding...\n");
@@ -1063,7 +1100,7 @@ int main(int argc, char* argv[])
 
     for (int root_idx = 0; root_idx < (int)root_ast_ids.size(); root_idx++)
     {
-        printf("Found %llu solution to \"%s\"\n", bdd.get_weight(roots[root_idx]), root_ast_names[root_idx].c_str());
+        printf("Found %llu solutions to \"%s\"\n", bdd.get_weight(roots[root_idx]), root_ast_names[root_idx].c_str());
     }
 
     if (display)
