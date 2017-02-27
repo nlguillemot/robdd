@@ -24,7 +24,9 @@
 
 //#define USE_TSX
 
-#define ITTPROFILE
+#define BENCHMARK
+
+//#define ITTPROFILE
 
 #ifdef ITTPROFILE
 #include <C:\Program Files (x86)\IntelSWTools\VTune Amplifier 2016 for Systems\include\ittnotify.h>
@@ -73,7 +75,11 @@ private:
 
         node* pool_alloc()
         {
+#ifdef SINGLETHREADED
+            uint32_t old_head = pool_head++;
+#else
             uint32_t old_head = InterlockedExchangeAdd((LONG*)&pool_head, 1);
+#endif
             
             if (old_head >= capacity)
             {
@@ -165,6 +171,7 @@ private:
                         const node* curr = to_node(tab);
                         if (curr->var == var && curr->lo == lo && curr->hi == hi)
                         {
+                            // note: potentially leaks a node
                             return to_handle(curr);
                         }
                         p = (p + 1) & bddutmask;
@@ -180,20 +187,23 @@ private:
                 {
                     const node* lonode = to_node(lo);
                     const node* hinode = to_node(hi);
-                    uint64_t loweight = (1ULL << (lonode->var - var - 1)) * lonode->weight;
-                    uint64_t hiweight = (1ULL << (hinode->var - var - 1)) * hinode->weight;
+                    uint64_t loweight = lonode->weight << (lonode->var - var - 1);
+                    uint64_t hiweight = hinode->weight << (hinode->var - var - 1);
                     new_node->weight = loweight + hiweight;
                 }
 
                 node_handle handle = to_handle(new_node);
+#ifdef SINGLETHREADED
+                table[p] = handle;
+                return handle;
+#else
                 node_handle previous_handle = InterlockedCompareExchange(&table[p], handle, invalid_handle);
 
                 if (previous_handle == invalid_handle)
                 {
                     return handle;
                 }
-
-                // leak the node
+#endif
             }
         }
     };
@@ -224,33 +234,51 @@ private:
         };
 
         std::unique_ptr<ctnode[]> table;
-        std::unique_ptr<uint64_t[]> lockbits;
+        std::unique_ptr<uint32_t[]> locks;
 
         static constexpr uint32_t hash(node_handle bdd1, node_handle bdd2, uint32_t op)
         {
             return bddctmask & (bdd1 + bdd2 + op);
         }
 
-        void acquire(uint32_t i)
+        void acquire_read(uint32_t i)
         {
-            uint32_t bits_index = i >> 6;
-            uint32_t bit_index = i - (bits_index << 6);
-            uint64_t bit = 1ULL << bit_index;
+#ifndef SINGLETHREADED
             for (;;)
             {
-                if (!(InterlockedOr64((LONGLONG*)&lockbits[bits_index], bit) & bit))
+                if (InterlockedIncrement((LONG*)&locks[i]) <= 255)
                 {
                     break;
                 }
             }
+#endif
         }
 
-        void release(uint32_t i)
+        void release_read(uint32_t i)
         {
-            uint32_t bits_index = i >> 6;
-            uint32_t bit_index = i - (bits_index << 6);
-            uint64_t bit = 1ULL << bit_index;
-            InterlockedAnd64((LONGLONG*)&lockbits[bits_index], ~bit);
+#ifndef SINGLETHREADED
+            InterlockedDecrement((LONG*)&locks[i]);
+#endif
+        }
+
+        void acquire_write(uint32_t i)
+        {
+#ifndef SINGLETHREADED
+            for (;;)
+            {
+                if (InterlockedCompareExchange(&locks[i], 255, 0) == 0)
+                {
+                    break;
+                }
+            }
+#endif
+        }
+
+        void release_write(uint32_t i)
+        {
+#ifndef SINGLETHREADED
+            InterlockedExchange(&locks[i], 0);
+#endif
         }
 
     public:
@@ -262,11 +290,13 @@ private:
                 table[i].bdd1 = invalid_handle;
             }
 
-            lockbits.reset(new uint64_t[capacity / 64]);
-            for (uint32_t i = 0; i < capacity / 64; i++)
+#ifndef SINGLETHREADED
+            locks.reset(new uint32_t[capacity]);
+            for (uint32_t i = 0; i < capacity; i++)
             {
-                lockbits[i] = 0;
+                locks[i] = 0;
             }
+#endif
         }
 
         node_handle find(node_handle bdd1, node_handle bdd2, uint32_t op)
@@ -275,7 +305,7 @@ private:
 
             ctnode found;
 
-#ifdef USE_TSX
+#if !defined(SINGLETHREADED) && defined(USE_TSX)
             if (_xbegin() == _XBEGIN_STARTED)
             {
                 found = table[h];
@@ -284,11 +314,11 @@ private:
             else
 #endif
             {
-                acquire(h);
+                acquire_read(h);
                 {
                     found = table[h];
                 }
-                release(h);
+                release_read(h);
             }
 
             node_handle result;
@@ -311,7 +341,7 @@ private:
             
             ctnode newnode = ctnode(op, bdd1, bdd2, r);
 
-#ifdef USE_TSX
+#if !defined(SINGLETHREADED) && defined(USE_TSX)
             if (_xbegin() == _XBEGIN_STARTED)
             {
                 table[h] = newnode;
@@ -320,11 +350,11 @@ private:
             else
 #endif
             {
-                acquire(h);
+                acquire_write(h);
                 {
                     table[h] = newnode;
                 }
-                release(h);
+                release_write(h);
             }
         }
     };
@@ -339,14 +369,14 @@ private:
     uint32_t max_level;
 
 public:
-    robdd(uint32_t num_vars)
+    robdd(uint32_t num_vars, uint32_t num_threads = -1)
     {
         uniquetb.init(num_vars);
 
         false_node = uniquetb.get_false();
         true_node = uniquetb.get_true();
 
-        max_level = tbb::task_scheduler_init::default_num_threads() - 1;
+        max_level = ((num_threads == -1 ? tbb::task_scheduler_init::default_num_threads() : num_threads) - 1) * 2;
 #ifdef SINGLETHREADED
         max_level = 0;
 #endif
@@ -564,8 +594,8 @@ void decode(
     {
         const bdd_instr& inst = instrs[i];
 
-        // run the first few instructions single-threaded since they don't do much work
-        uint32_t level = i < 100 ? 99999999 : 0;
+        // initial level of depth
+        uint32_t level = 0;
 
         int inst_dst_ast_id = -1;
         robdd::node_handle inst_dst_node = robdd::invalid_handle;
@@ -579,7 +609,7 @@ void decode(
             const char* ast_name = inst.operand_newinput_name->c_str();
 
 #ifdef SHOW_INSTRS
-            printf("new %d (%s)\n", ast_id, ast_name);
+            printf("%d = new %d (%s)\n", ast_id, var_id, ast_name);
 #endif
 
             robdd::node_handle new_bdd = r->make_node(var_id, false_node, true_node);
@@ -999,7 +1029,6 @@ int main(int argc, char* argv[])
     lua_newtable(L);
     lua_setglobal(L, "output");
 
-
     if (luaL_dofile(L, infile))
     {
         printf("%s\n", lua_tostring(L, -1));
@@ -1062,55 +1091,85 @@ int main(int argc, char* argv[])
     bool display = lua_isboolean(L, -1) ? lua_toboolean(L, -1) != 0: false;
     lua_pop(L, 1);
 
-    robdd bdd(g_num_variables);
-    std::vector<robdd::node_handle> roots(root_ast_ids.size());
+    int max_threads = tbb::task_scheduler_init::default_num_threads();
+    
+    int initial_num_threads = max_threads;
+#ifdef BENCHMARK
+    initial_num_threads = 0;
+#endif
 
-    printf("decoding...\n");
-
-    LARGE_INTEGER now, then, freq;
-    QueryPerformanceFrequency(&freq);
-
-    QueryPerformanceCounter(&then);
-
-    decode(
-        (int)g_bdd_instructions.size(), g_bdd_instructions.data(),
-        g_next_ast_id - ast_id_user, // num user ast nodes
-        (int)root_ast_ids.size(), root_ast_ids.data(),
-        &bdd,
-        roots.data());
-
-    QueryPerformanceCounter(&now);
-
-    UINT64 seconds = (now.QuadPart - then.QuadPart) / freq.QuadPart;
-    UINT64 milliseconds = (now.QuadPart - then.QuadPart) * 1000 / freq.QuadPart;
-    UINT64 microseconds = (now.QuadPart - then.QuadPart) * 1000000 / freq.QuadPart;
-
-    if (seconds > 0)
+    for (int num_threads = initial_num_threads; num_threads <= max_threads; num_threads++)
     {
-        printf("Finished in %.3lf seconds\n", double(now.QuadPart - then.QuadPart) / freq.QuadPart);
-    }
-    else if (milliseconds > 0)
-    {
-        printf("Finished in %.3lf milliseconds\n", double(now.QuadPart - then.QuadPart) * 1000.0 / freq.QuadPart);
-    }
-    else
-    {
-        printf("Finished in %.3lf microseconds\n", double(now.QuadPart - then.QuadPart) * 1000000.0 / freq.QuadPart);
-    }
+        robdd bdd(g_num_variables);
+        std::vector<robdd::node_handle> roots(root_ast_ids.size(), num_threads);
 
-    for (int root_idx = 0; root_idx < (int)root_ast_ids.size(); root_idx++)
-    {
-        printf("Found %llu solutions to \"%s\"\n", bdd.get_weight(roots[root_idx]), root_ast_names[root_idx].c_str());
-    }
+#ifndef BENCHMARK
+        if (num_threads != 0)
+        {
+            printf("decoding with %d threads...\n", num_threads);
+        }
+#endif
 
-    if (display)
-    {
-        printf("writing dot file...\n");
+        // num_threads == 0 does a warmup run to attempt to nullify cache effects that penalize the first run
+        tbb::task_scheduler_init scheduler_init(num_threads == 0 ? -1 : num_threads);
 
-        write_dot(
-            title,
-            (int)roots.size(), roots.data(), root_ast_names.data(),
+        LARGE_INTEGER now, then, freq;
+        QueryPerformanceFrequency(&freq);
+
+        QueryPerformanceCounter(&then);
+
+        decode(
+            (int)g_bdd_instructions.size(), g_bdd_instructions.data(),
+            g_next_ast_id - ast_id_user, // num user ast nodes
+            (int)root_ast_ids.size(), root_ast_ids.data(),
             &bdd,
-            outfile);
+            roots.data());
+
+        QueryPerformanceCounter(&now);
+
+        if (num_threads == 0)
+        {
+            continue;
+        }
+
+        UINT64 seconds = (now.QuadPart - then.QuadPart) / freq.QuadPart;
+        UINT64 milliseconds = (now.QuadPart - then.QuadPart) * 1000 / freq.QuadPart;
+        UINT64 microseconds = (now.QuadPart - then.QuadPart) * 1000000 / freq.QuadPart;
+
+#ifdef BENCHMARK
+        printf("%d, %.3lf\n", num_threads, double(now.QuadPart - then.QuadPart) / freq.QuadPart);
+#else
+        if (seconds > 0)
+        {
+            printf("Finished in %.3lf seconds\n", double(now.QuadPart - then.QuadPart) / freq.QuadPart);
+        }
+        else if (milliseconds > 0)
+        {
+            printf("Finished in %.3lf milliseconds\n", double(now.QuadPart - then.QuadPart) * 1000.0 / freq.QuadPart);
+        }
+        else
+        {
+            printf("Finished in %.3lf microseconds\n", double(now.QuadPart - then.QuadPart) * 1000000.0 / freq.QuadPart);
+        }
+
+        for (int root_idx = 0; root_idx < (int)root_ast_ids.size(); root_idx++)
+        {
+            printf("Found %llu solutions to \"%s\"\n", bdd.get_weight(roots[root_idx]), root_ast_names[root_idx].c_str());
+        }
+
+        if (num_threads == max_threads)
+        {
+            if (display)
+            {
+                printf("writing dot file...\n");
+
+                write_dot(
+                    title,
+                    (int)roots.size(), roots.data(), root_ast_names.data(),
+                    &bdd,
+                    outfile);
+            }
+        }
+#endif
     }
 }

@@ -2,7 +2,7 @@ n = 12
 
 display = n <= 6
 
-title = tostring(n) .. '-queens problem'
+title = tostring(n) .. '-queens puzzle'
 
 function cellname(row, col)
     return 'r' .. tostring(row) .. 'c' .. tostring(col)
@@ -13,6 +13,7 @@ for row=1,n do
         _ = input[cellname(row,col)]
     end
 end
+for row=1,n do for col=1,n do _ = input[cellname(row,col)] end end
 
 board = true
 for row=n,1,-1 do
@@ -33,17 +34,25 @@ for row=n,1,-1 do
        -- cannot overlap with other queens in the same diagonal
        -- (optimization: only consider cells top-right and top-left of them)
        -- top left:
+       -- row
+       for col2=col+1,n do T = T + input[cellname(row, col2)] end
+       -- column
+       for row2=row+1,n do T = T + input[cellname(row2, col)] end
+       -- top left
        for col2=col-1,1,-1 do
            if row+(col-col2) > n then
                break
            end
+           if row+(col-col2) > n then break end
            T = T + input[cellname(row+(col-col2), col2)]
        end
        -- top right:
+       -- top right
        for col2=col+1,n do
            if row+(col2-col) > n then
                break
            end
+           if row+(col2-col) > n then break end
            T = T + input[cellname(row+(col2-col), col2)]
        end
        -- output['T' .. 'r' .. tostring(row) .. 'c' .. tostring(col)] = T
@@ -51,12 +60,12 @@ for row=n,1,-1 do
        board = board * -(T * input[cellname(row, col)])
     end
     -- OR the row into T, since each row must have at least one queen
+    -- at least 1 queen
     T = false
     for col=n,1,-1 do
         T = T + input[cellname(row, col)]
     end
     -- output['row ' .. tostring(row)] = T
+    for col=n,1,-1 do T = T + input[cellname(row, col)] end
     board = board * T
 end
-
-output.board = board

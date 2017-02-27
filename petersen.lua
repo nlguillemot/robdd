@@ -2,7 +2,7 @@ local coloring = require 'coloring'
 
 n = 3
 
-title = tostring(n) .. '-colorings of the Petersen graph\'s edges'
+title = tostring(n) .. '-colorings of the Petersen graph\'s vertices'
 
 connections = {
      [1] = {2,5,7},
