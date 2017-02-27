@@ -22,6 +22,8 @@
 
 //#define SINGLETHREADED
 
+#define USE_TSX
+
 #define ITTPROFILE
 
 #ifdef ITTPROFILE
@@ -253,11 +255,21 @@ private:
 
             ctnode found;
 
-            acquire(h);
+#ifdef USE_TSX
+            if (_xbegin() == _XBEGIN_STARTED)
             {
                 found = table[h];
+                _xend();
             }
-            release(h);
+            else
+#endif
+            {
+                acquire(h);
+                {
+                    found = table[h];
+                }
+                release(h);
+            }
 
             node_handle result;
 
@@ -279,11 +291,21 @@ private:
             
             ctnode newnode = ctnode(op, bdd1, bdd2, r);
 
-            acquire(h);
+#ifdef USE_TSX
+            if (_xbegin() == _XBEGIN_STARTED)
             {
                 table[h] = newnode;
+                _xend();
             }
-            release(h);
+            else
+#endif
+            {
+                acquire(h);
+                {
+                    table[h] = newnode;
+                }
+                release(h);
+            }
         }
     };
 
