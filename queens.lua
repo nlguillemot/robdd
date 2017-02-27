@@ -69,3 +69,5 @@ for row=n,1,-1 do
     for col=n,1,-1 do T = T + input[cellname(row, col)] end
     board = board * T
 end
+
+output.board = board

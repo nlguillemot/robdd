@@ -22,6 +22,8 @@
 
 //#define SINGLETHREADED
 
+//#define USE_APPLY_TASK
+
 //#define USE_TSX
 
 #define BENCHMARK
@@ -422,14 +424,150 @@ public:
         return uniquetb.insert(var, lo, hi);
     }
 
+#ifdef USE_APPLY_TASK
+    class make_node_task : public tbb::task
+    {
+        robdd* m_bdd;
+        node_handle m_bdd1;
+        node_handle m_bdd2;
+        uint32_t m_op;
+        node_handle* m_n;
+
+    public:
+        uint32_t var;
+        node_handle lo;
+        node_handle hi;
+
+        make_node_task(robdd* bdd, node_handle bdd1, node_handle bdd2, uint32_t op, node_handle* n)
+            : m_bdd(bdd)
+            , m_bdd1(bdd1)
+            , m_bdd2(bdd2)
+            , m_op(op)
+            , m_n(n)
+        { }
+
+        tbb::task* execute() override
+        {
+            *m_n = m_bdd->make_node(var, lo, hi);
+            m_bdd->computedtb.insert(m_bdd1, m_bdd2, m_op, *m_n);
+            return NULL;
+        }
+    };
+
+    class apply_task : public tbb::task
+    {
+        robdd* m_bdd;
+        node_handle m_bdd1;
+        node_handle m_bdd2;
+        uint32_t m_op;
+        uint32_t m_level;
+        node_handle* m_n;
+
+    public:
+        apply_task(robdd* bdd, node_handle bdd1, node_handle bdd2, uint32_t op, uint32_t level, node_handle* n)
+            : m_bdd(bdd)
+            , m_bdd1(bdd1)
+            , m_bdd2(bdd2)
+            , m_op(op)
+            , m_level(level)
+            , m_n(n)
+        { }
+
+        tbb::task* execute() override
+        {
+            if (m_level >= m_bdd->max_level)
+            {
+                *m_n = m_bdd->apply_seq(m_bdd1, m_bdd2, m_op);
+                return NULL;
+            }
+
+            node_handle found = m_bdd->computedtb.find(m_bdd1, m_bdd2, m_op);
+            if (found != invalid_handle)
+            {
+                *m_n = found;
+                return NULL;
+            }
+
+            // handle terminal vs terminal op
+            if ((m_bdd1 == m_bdd->false_node || m_bdd1 == m_bdd->true_node) &&
+                (m_bdd2 == m_bdd->false_node || m_bdd2 == m_bdd->true_node))
+            {
+                bool bdd1_value = m_bdd1 == m_bdd->true_node;
+                bool bdd2_value = m_bdd2 == m_bdd->true_node;
+
+                node_handle n;
+
+                switch (m_op)
+                {
+                case opcode::bdd_and:
+                    n = (bdd1_value && bdd2_value) ? m_bdd->true_node : m_bdd->false_node;
+                    break;
+                case opcode::bdd_or:
+                    n = (bdd1_value || bdd2_value) ? m_bdd->true_node : m_bdd->false_node;
+                    break;
+                case opcode::bdd_xor:
+                    n = (bdd1_value != bdd2_value) ? m_bdd->true_node : m_bdd->false_node;
+                    break;
+                }
+                *m_n = n;
+                return NULL;
+            }
+
+            make_node_task& c = *new (allocate_continuation()) make_node_task(m_bdd, m_bdd1, m_bdd2, m_op, m_n);
+
+            apply_task* a;
+
+            if (m_bdd->get_var(m_bdd1) == m_bdd->get_var(m_bdd2))
+            {
+                a = new (c.allocate_child()) apply_task(m_bdd, m_bdd->get_lo(m_bdd1), m_bdd->get_lo(m_bdd2), m_op, m_level + 1, &c.lo);
+                c.var = m_bdd->get_var(m_bdd1);
+
+                m_bdd1 = m_bdd->get_hi(m_bdd1);
+                m_bdd2 = m_bdd->get_hi(m_bdd2);
+                m_level = m_level + 1;
+                m_n = &c.hi;
+            }
+            else if (m_bdd->get_var(m_bdd1) < m_bdd->get_var(m_bdd2))
+            {
+                a = new (c.allocate_child()) apply_task(m_bdd, m_bdd->get_lo(m_bdd1), m_bdd2, m_op, m_level + 1, &c.lo);
+                c.var = m_bdd->get_var(m_bdd1);
+
+                m_bdd1 = m_bdd->get_hi(m_bdd1);
+                m_level = m_level + 1;
+                m_n = &c.hi;
+            }
+            else
+            {
+                a = new (c.allocate_child()) apply_task(m_bdd, m_bdd1, m_bdd->get_lo(m_bdd2), m_op, m_level + 1, &c.lo);
+                c.var = m_bdd->get_var(m_bdd2);
+
+                m_bdd2 = m_bdd->get_hi(m_bdd2);
+                m_level = m_level + 1;
+                m_n = &c.hi;
+            }
+
+            recycle_as_child_of(c);
+            c.set_ref_count(2);
+            spawn(*a);
+            return this;
+        }
+    };
+
     node_handle apply(node_handle bdd1, node_handle bdd2, uint32_t op, uint32_t level)
+    {
+        node_handle n;
+        tbb::task::spawn_root_and_wait(*new(tbb::task::allocate_root()) apply_task(this, bdd1, bdd2, op, level, &n));
+        return n;
+    }
+
+    node_handle apply_seq(node_handle bdd1, node_handle bdd2, uint32_t op)
     {
         node_handle found = computedtb.find(bdd1, bdd2, op);
         if (found != invalid_handle)
         {
             return found;
         }
-        
+
         // handle terminal vs terminal op
         if ((bdd1 == false_node || bdd1 == true_node) &&
             (bdd2 == false_node || bdd2 == true_node))
@@ -448,9 +586,63 @@ public:
             }
             return invalid_handle;
         }
-        
+
         node_handle n;
-        
+
+        node_handle lo, hi;
+        if (get_var(bdd1) == get_var(bdd2))
+        {
+            lo = apply_seq(get_lo(bdd1), get_lo(bdd2), op);
+            hi = apply_seq(get_hi(bdd1), get_hi(bdd2), op);
+            n = make_node(get_var(bdd1), lo, hi);
+        }
+        else if (get_var(bdd1) < get_var(bdd2))
+        {
+            lo = apply_seq(get_lo(bdd1), bdd2, op);
+            hi = apply_seq(get_hi(bdd1), bdd2, op);
+            n = make_node(get_var(bdd1), lo, hi);
+        }
+        else
+        {
+            lo = apply_seq(bdd1, get_lo(bdd2), op);
+            hi = apply_seq(bdd1, get_hi(bdd2), op);
+            n = make_node(get_var(bdd2), lo, hi);
+        }
+
+        computedtb.insert(bdd1, bdd2, op, n);
+
+        return n;
+    }
+#else
+    node_handle apply(node_handle bdd1, node_handle bdd2, uint32_t op, uint32_t level)
+    {
+        node_handle found = computedtb.find(bdd1, bdd2, op);
+        if (found != invalid_handle)
+        {
+            return found;
+        }
+
+        // handle terminal vs terminal op
+        if ((bdd1 == false_node || bdd1 == true_node) &&
+            (bdd2 == false_node || bdd2 == true_node))
+        {
+            bool bdd1_value = bdd1 == true_node;
+            bool bdd2_value = bdd2 == true_node;
+
+            switch (op)
+            {
+            case opcode::bdd_and:
+                return (bdd1_value && bdd2_value) ? true_node : false_node;
+            case opcode::bdd_or:
+                return (bdd1_value || bdd2_value) ? true_node : false_node;
+            case opcode::bdd_xor:
+                return (bdd1_value != bdd2_value) ? true_node : false_node;
+            }
+            return invalid_handle;
+        }
+
+        node_handle n;
+
 #ifndef SINGLETHREADED
         if (level < max_level)
         {
@@ -504,6 +696,7 @@ public:
 
         return n;
     }
+#endif
 };
 
 struct bdd_instr
@@ -1100,8 +1293,8 @@ int main(int argc, char* argv[])
 
     for (int num_threads = initial_num_threads; num_threads <= max_threads; num_threads++)
     {
-        robdd bdd(g_num_variables);
-        std::vector<robdd::node_handle> roots(root_ast_ids.size(), num_threads);
+        robdd bdd(g_num_variables, num_threads == 0 ? -1 : num_threads);
+        std::vector<robdd::node_handle> roots(root_ast_ids.size());
 
 #ifndef BENCHMARK
         if (num_threads != 0)
